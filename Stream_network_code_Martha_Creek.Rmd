@@ -1,0 +1,2391 @@
+------------------------------------------------------------------------
+
+"Stream Network Model for Martha Creek" 
+Derived from model created by Brian Saccardi and Matthew Winnick" Hannah Conroy "March 3, 2022
+
+You should have the following libraries installed before running the program: library(cowplot) library(dplyr) library(fields) library(geosphere) library(GGally) library(ggplot2) library(gridExtra) library(knitr) library(lubridate) library(manipulate) library(maps) library(maptools) library(metR) library(mltools) library(olsrr) library(raster) library(RColorBrewer) library(reshape2) library(rgdal) library(rgeos) library(sf) library(sjPlot) library(sp) library(suncalc)
+
+The following is the stream network model adapted from the Saccardi and Winnick paper 2021 'Improving predictions of stream CO2 concentrations and fluxes using a stream network model: a case study in the East River Watershed, CO, USA'. The code was adapted for the paper "Seasonality Drives Carbon Emissions along a Stream Network" by Conroy et al. 2023 by Hannah Conroy. The model is run twice, once without adjustments based on field measurements and once with adjustments based on field measurements. The model can be run over two months - August and November.
+
+After all the libraries are installed you will need to download and unzip the 'Spatial Files Used in Model' folder, save it to your computer and define the location in R. To define the file location in this code replace 'C:/Users/Name/Documents/Spatial Files Used in Model' with the location of the folder on your computer and be sure to use forward slashes (/).
+
+Define the folder location within this block of code as it sets working directory for all code chunks. note that each section should be run in order and errors may arise if sections are run multiple times, to run all chunks of code at one time click (Run \> Run All or Ctrl+Alt+R).
+
+```{r setup, include=FALSE, echo=FALSE}
+require("knitr")
+opts_knit$set(root.dir ='/Users/Hannah/OneDrive - UW/NEON Data/Stream_Network/Spatial Files_MART')
+```
+
+Get initial data. This is run and used in following chunks to speed up model runs. Run first and set desired month.
+
+```{r}
+rm(list=ls())
+require(rgdal)
+library(raster)
+library(geosphere)
+library(fields)
+library(readxl)
+library(dplyr)
+
+#Change to run correct month files 
+month <- "nov" #"aug" OR #"nov"
+
+# READ IN STREAM LINE VERTICES
+map <- read_xlsx(paste0("stream_points_",month, ".xlsx"))
+
+# READ IN NHDPLUS LINES
+lines <- readOGR('.', paste0('Martha_Creek_flowlines_',month)) #change per season
+
+# READ IN PRE-MADE CSV FILES OF STREAM REACH INFORMATION AND CATCHMENT AREA
+stream_reach <- read_xlsx(paste0("stream_reach_",month, ".xlsx"))  #Derived from Martha Creek Flowlines
+stream_reach <-  stream_reach[order(stream_reach$OBJECTID),] #sort
+catchment <- read_xls('catchment_areas.xls')
+
+#Replace lines@data with stream reach file to keep identifiers intact
+lines@data <- stream_reach
+
+#Change identifier to be numeric 
+PI <- stream_reach$Permanent_Identifier
+PI <- as.data.frame(PI)
+colnames(PI)[1] <- "Permanent_Identifier"
+
+len <- length(PI$Permanent_Identifier)
+PI["New_Identifier"] <- seq(2001,len+2000)
+
+stream_reach <- merge(PI,stream_reach, by="Permanent_Identifier")
+stream_reach <- subset(stream_reach, select=-c(Permanent_Identifier))
+stream_reach <- stream_reach %>% dplyr::rename(Permanent_Identifier = New_Identifier)
+stream_reach <-  stream_reach[order(stream_reach$OBJECTID),] #sort
+
+map <- merge(map, PI, by="Permanent_Identifier")
+map <-  map[order(map$New_Identifier),] #sort
+map <- subset(map, select=-c(Permanent_Identifier))
+names(map)[names(map) == 'New_Identifier'] <- "Permanent_Identifier"
+map$x <-map$coords.x1
+map$x2 <- map$coords.x2
+coordinates(map) <- ~ coords.x1 + coords.x2 #change to be spatial data frame 
+
+lines@data <- merge(lines@data, PI, by="Permanent_Identifier")
+lines@data <- subset(lines@data, select=-c(Permanent_Identifier))
+lines@data <- lines@data %>% dplyr::rename(Permanent_Identifier = New_Identifier)
+
+# import digital elevation model
+dem <- raster('dem_usgs.tif')
+## CONVERT TO LAT LON COORDINATES FROM UTM
+dem <- projectRaster(dem, crs = '+proj=longlat +datum=NAD83 +no_defs +ellps=GRS80 +towgs84=0,0,0')
+
+
+```
+
+This is the model without inputs from the field sampling performed at Martha Creek. A map of discharge will be printed at the end as a quick check that the model ran correctly.
+
+```{r}
+# ### Martha Creek Network Model
+# # libraries 
+rm(list=ls()[! ls() %in% c("month","map", "lines", "stream_reach", "catchment", "PI", "dem")])
+require(rgdal)
+library(raster)
+library(geosphere)
+library(fields)
+
+Qthresh <- 0.000 
+C_gwb <- 0 #not used in current model 
+
+#NEP by month - for stream metabolism (-NEP assumed to be rate of in-stream CO2)
+if(month == "nov") {
+nep = 1.10 #g CO2 * m^-2 * day^-1
+} else {
+nep = 0.41 #g CO2 * m^-2 * day^-1  
+} 
+
+#Cgw based on well data for the month - average of Well 3 and Well 6 during sampling period 
+if(month == "aug") {
+groundwater = 12750 #ppm 
+} else {
+groundwater = 12205 #ppm^2  
+} 
+
+
+## CALCULATE CATCHMENT SLOPE, ASPECT, AND HILLSHADE MAPS
+slope <- terrain(dem)
+aspect <- terrain(dem, opt = 'aspect')
+hill <- hillShade(slope, aspect)
+
+########## #slope method###########################
+area_slope <- terrain(dem, opt = 'slope', unit = 'radians') #make slope dem #dem is an imported digital elevation model, any one you have should work and it is loaded with raster 
+library(sf) #import library
+setCRS <- st_crs(dem) #make a variable that has the same CRS and the dem
+class(setCRS) #make sure the class is crs
+pointsall<- as.data.frame(map@coords)#this is the locations you want slopes of
+pointsdata_sp <- st_as_sf(pointsall, coords = c("coords.x1", "coords.x2"), crs = setCRS) #set up point data
+sites_vals <- extract(area_slope,
+                      pointsdata_sp,
+                      buffer = 5,
+                      fun = mean,
+                      sp = TRUE) # extract the mean values w/in a 2m radius around each point
+st_crs(sites_vals) # check its crs
+plot(sites_vals) # plot points should look like the stream layout
+slope<-sites_vals$slope # the point by point slope
+slope<-tan(slope) # convert slope into decimal not %
+write.csv(slope,'slopetable.csv')
+###################################################
+
+#calculated in supplemental code 
+slope<-read.csv('slopetable.csv',header = T)
+
+for(i in 1:length(slope)){
+  if(slope[i,1] == 0){
+    slope[i,1] <- 0.01716722 #lowest slope predicted in model
+  }else{
+    slope[i,1] <- slope[i,1]
+  }
+}
+
+### ELEVATIONS OF VERTICES
+#.rs.unloadPackage("tidyr") #if needed 
+e <- extract(dem, coordinates(map)[,-3])
+### MAKE A TABLE OF COORDINATES, ELEVATIONS
+table <- coordinates(map)[,-3]
+table <- cbind(table, e)
+
+### EXTRACT STREAM REACH ID'S AND ADD TO OVERALL TABLE
+plusId <- array(dim = length(map$LengthKM))
+for(i in 1:length(plusId)){
+  plusId[i] <- toString(map$Permanent_Identifier[i])
+}
+table <- cbind(table,as.numeric(plusId))
+ids <- as.numeric(unique(plusId))
+
+n_ids <- array(dim = length(as.numeric(plusId)))
+for(i in 1:length(n_ids)){
+  n_ids[i] <- stream_reach$NHDPlusID[which(stream_reach$Permanent_Identifier == as.numeric(plusId[i]))]
+}
+
+### CALCULATE DISTANCE BETWEEN POINTS WITHIN EACH REACH
+## FIRST CREATE SPACE TO STORE THIS DATA
+total_length <- array(dim = length(ids))
+delta_l <- array(dim = dim(table)[1])
+total_l <- array(dim = dim(table)[1])
+
+### LOOP THROUGH EACH INDIVIDUAL STREAM REACH
+for(i in 1:length(ids)){
+  reach <- table[which(table[,4] == ids[i]),] # PULL OUT POINTS FOR THE CURRENT STREAM REACH
+  de <- dl <- dls <- array(dim = dim(reach)[1]) # SET EMPTY ARRAYS TO STORE CHANGE IN ELEVATION/LENGTH DATA, total length along reach
+  for(j in 2:dim(reach)[1]){    # LOOP THROUGH POINTS IN THE CURRENT STREAM REACH
+    de[j] <- reach[j,3] - reach[j-1,3]  # CALCULATE THE DIFFERENCE IN ELEVATION BETWEEN POINTS
+    dl[j] <- distm(reach[j,1:2], reach[j-1,1:2])  # CALCULATE THE DISTANCE BETWEEN POINTS
+    dls[j] <- ifelse(is.na(dls[j-1]), 0, dls[j-1]) + dl[j]
+    #slope[which(table[,4] == ids[i])] <- -de/dl   # CALCULATE THE SLOPE BETWEEN POINTS     #used point slope
+  }
+  delta_l[which(table[,4]==ids[i])] <- dl    # STORE THE DATA IN THE EMPTY ARRAY CREATED BEFORE THE LOOP
+  total_l[which(table[,4]==ids[i])] <- dls
+  total_length[i] <- sum(dl, na.rm = T)      # STORE THE DATA IN THE EMPTY ARRAY CREATED BEFORE THE LOOP
+}
+
+### ADD SLOPES TO DATATABLE
+table <- cbind(table, slope[2])
+
+### EXTRACTS CATCHMENT AREAS AND PUTS THEM IN THE SAME ORDER AS THE STREAM REACH DATA
+reach_area <- array(dim = dim(stream_reach)[1])
+for(i in 1:length(reach_area)){
+  if(length(which(catchment$NHDPlusID == stream_reach$NHDPlusID[i])) > 0){
+  reach_area[i] <- catchment$AreaSqKm[which(catchment$NHDPlusID == stream_reach$NHDPlusID[i])]
+}}
+
+#### IDENTIFY HEADWATERS BY SEEING WHICH ONES DON'T HAVE
+#### THEIR FIRST POINT INCLUDED IN ANOTHER REACH
+#### IF HEAD = 1, THEN IT'S A HEADWATERS STREAM
+head <- array(dim = length(ids))
+for(i in 1:length(ids)){
+  reach <- table[which(table[,4] == ids[i]),]
+  x <- which(table[,1] == reach[1,1] & table[,2] == reach[1,2])
+    head[i] = length(x)
+}
+#headwater + IDS
+headids <- cbind(head,ids)
+colnames(headids)[2] <- "Permanent_Identifier"
+
+hn <- length(which(head == "1"))
+
+nhd_id <- array(dim = dim(table)[1])
+for(i in 1:length(nhd_id)){
+  nhd_id[i] <- stream_reach$NHDPlusID[which(stream_reach$Permanent_Identifier == table[i,4])]
+}
+
+#### ADD TO THE OVERALL TABLE
+table <- cbind(table, nhd_id)
+
+#### INCORPORATE CATCHMENT AREA INTO THE OVERALL TABLE
+area <- array(dim = dim(table)[1])
+for(i in 1:length(area)){
+  if(length(which(catchment$NHDPlusID == table[i,6])) > 0)
+  area[i] <- catchment$AreaSqKm[which(catchment$NHDPlusID == table[i,6])]
+}
+table <- cbind(table,area)
+
+#### CURRENTLY ASSUMES that headwaters streams start at 50% of the area of the reach
+
+#### set conditions for the basin
+#calculate Henry's constant 
+A <- 108.3865# constant 
+B <- 0.01985076 # constant 
+C <- -6919.53 # constant 
+D <- -40.4515 # constant 
+E <- 669365 # constant 
+
+#Read in temperature file with temperatures set by stream order (from sample data)
+temp <- read_xlsx("/Users/Hannah/OneDrive - UW/NEON Data/Stream_Network/Spatial Files_MART/temp.xlsx", sheet = month) 
+temp$TK <- temp$temperature + 273.15 #Kelvins
+temp$KH <- 10^(A+B*temp$TK+C/temp$TK+D*log10(temp$TK)+E/temp$TK^2) #KH for each temp
+temp$sc <- 1911-118.11*temp$temperature+3.453*temp$temperature^2-0.0413*temp$temperature^3 #Wanninkhof, 1992
+#other methods to calculate sc 
+#temp$sc <- 1742-91.24*temp$temperature+2.208*temp$temperature^2-0.0219*temp$temperature^3 #Raymond et al., 2017
+#temp$sc <- 1923.6-125.06*temp$temperature+4.3773*temp$temperature^2-0.085681*temp$temperature^3 - 0.00070284*temp$temperature^4 #Wanninkhof, 2014
+
+#Area at stream gauge 
+if(month == "aug") {
+Era = 1380000 #m^2 
+} else {
+Era = 3107000 #m^2  
+} #Sets area for stream gauge based on month. Units are m^2.  
+
+#Discharge at stream gauge 
+if(month == "aug") {
+ERQ = 5.23E-3
+} else {
+ERQ = 1.8677 
+} #Sets discharge for stream gauge based on month. Units are m^3/s. Discharge is average over sample week.  
+
+nep <- nep/24/3600/44.01   #correct units - mols * m^-2 * s^-1  
+
+
+table <- cbind(table,delta_l)
+
+# bring in bog and snow locations - NA for Martha Creek in August and September 
+table$loca <- "N"
+
+table <- cbind(table,total_l)
+
+#Calculate fraction of length for each point on each stream reach - to be used for flow calculation  
+area_fraction <- array(dim = dim(table)[1])
+for(i in 1:length(ids)){
+  reach <- table[which(table[,4] == ids[i]),] # PULL OUT POINTS FOR THE CURRENT STREAM REACH
+  daf <- array(dim = dim(reach)[1]) # SET EMPTY ARRAYS TO STORE AREA FRACTION
+  daf[1] <- 0
+  for(j in 2:dim(reach)[1]){    # LOOP THROUGH POINTS IN THE CURRENT STREAM REACH
+    daf[j] <- reach[j,10]/reach[dim(reach)[1],10]  # CALCULATE THE area fraction of each reach
+  }
+  area_fraction[which(table[,4]==ids[i])] <- daf    # STORE THE DATA IN THE EMPTY ARRAY CREATED BEFORE THE LOOP
+}
+
+table <- cbind(table,area_fraction)
+
+library(dplyr)
+
+headids <- data.frame(headids)
+#CODE TO CREATE NAMES FROM HYDROSEQUENCE - puts stream IDs in correct order to run 
+names <- subset(stream_reach, select=c(Permanent_Identifier,HydrologicSequence, StreamOrder))
+names <- merge(names, headids, by = "Permanent_Identifier")
+names$HydrologicSequence <- ifelse(names$head == 1, 55500400271606, names$HydrologicSequence)
+names <-  names[order(-names$HydrologicSequence),] #sort descending
+names <- subset(names, select=c(Permanent_Identifier))
+names <- as.integer(names[,1])
+
+
+l <- list() 
+for(i in 1:length(names)){
+  ### FIRST XX STREAM SEGEMENTS ARE HEADWATERS - NEED TO SET INITIAL Q, AREA, AND CO2
+  if(i <= hn){
+    l <- append(l, list(table[which(table[,4] == names[i]),1:11]))
+    snow <- q <- area <- width <- velocity <- depth <- c_back <- c_back_2 <- eD<- k_600<- k_co2 <- u <- km <- scz <- c_back_3 <- c_back_4 <- array(dim = length(which(table[,4] == names[i])))
+    
+    
+    #Using conservation of mass - initial Qi = Qg * Ai / Ag, units are m/s
+    #table[,7] is drainage area of stream section in km^2 (divided by two - assumes starts at half of catchment) * 10^6 m * ERQ (discharge at stream gauge (m^3/s)) / Era (drainage area at stream gauge (m^2). 
+     q[1] <- (l[[i]][1,7]/2)*10^6*ERQ / Era #m/s 
+    
+    area <- table[which(table[,4]==names[i]),7]
+    
+    KH <- temp$KH[1] #set KH based on order/temperature
+    CC_gw <- groundwater * 10^-6 *KH 
+    C_atm <- 400*10^-6*KH #mol/l  SETS ATMOSPHERIC CO2
+    
+    snow <- table[which(table[,4]==names[i]),9] 
+    snow <- as.character(snow)
+    order <- 1
+    c_back[1] <- c_back_2[1] <-  c_back_3[1] <- CC_gw #### SET THE INITIAL BOUNDARY CONDITION AS GW CO2 VALUES
+    #c_back[1] <- c_back_2[1] <-  c_back_3[1] <- 0
+    c_back_4[1] <- 0 
+    for(j in 2:length(q)){  ### LOOP THROUGH ALL THE POINTS IN THE STREAM REACH
+      
+      ### CALCULATE DISCHARGE AT NEW POINT BASED ON PREVIOUS POINT AND CHANGE IN AREA 
+      q[j] <- (l[[i]][j,7]/2 + (l[[i]][j,7]/2)*(l[[i]][j,11]))*10^6*ERQ / Era #Using conservation of mass - initial Qi = Qg * Ai / Ag, units are m/. Ai is calculated based on area fraction along stream. 
+      ##Horgby
+      velocity[j] <- 0.668*q[j]^0.365
+      depth[j] <- 0.298*q[j]^0.222
+      width[j] <- q[j]/velocity[j]/depth[j]
+        #August correction factor
+      if(month == "aug") { width[j] <- (width[j] *  8.5680) - 0.7614 } 
+      if((width[j]) < 0) {width[j] = 0.008387081}
+      #### Surface Renewal Theory Mass Transfer Coefficient
+      u[j] <- sqrt(9.8*depth[j]*l[[i]][j,5])
+      scz[j] <- 1.3e-6/1.6e-9
+      km[j] <- 0.17*u[j]*scz[j]^(-2/3)
+      ### NEED TO FIND REFERENCE, BUT ANOTHER METRIC OF STREAM TURBULENCE FOR CALCULATING GAS TRANSFER VELOCITY
+      eD[j] <- 9.8*velocity[j]*l[[i]][j,5]
+      ### USES THIS METRIC TO CALCULATE K_600
+      
+       #Equations to calculate k_600 - these can be used to compare results. The paper uses Ray 3 lower. Make sure to change one below as well.
+      #k_600[j] <-  ((velocity[j]*l[[length(l)]][j,5])^0.89*depth[j]^0.54*5037) #Ray 1
+      #k_600[j] <-  ((velocity[j]*l[[length(l)]][j,5])^0.91*depth[j]^0.57*4433) #Ray 1_lower
+    #k_600[j] <- 5937 * (velocity[j]*l[[length(l)]][j,5])^0.89 * depth[j]^0.58 * (1- 2.54 *   (velocity[j]/(depth[j]*9.8)^0.5))  #Ray_2
+       #k_600[j] <- 5331 * (velocity[j]*l[[length(l)]][j,5])^0.91 * depth[j]^0.61 * (1- 2.32 *   (velocity[j]/(depth[j]*9.8)^0.5)) #Ray 2_lower
+      #k_600[j] <- 1162 * l[[i]][j,5]^0.77 * velocity[j]^0.85 #Ray3
+      k_600[j] <- 970 * l[[i]][j,5]^0.798 * velocity[j]^0.895 #Ray3_lower
+      #k_600[j] <- 951.5 * (velocity[j]*l[[i]][j,5])^0.76 #Ray4
+      #k_600[j] <- 807.5 * (velocity[j]*l[[i]][j,5])^0.787 #Ray4 lower
+      #k_600[j] <- velocity[j]*l[[i]][j,5] * 2841 + 0.209 #Ray5 
+      #k_600[j] <- velocity[j]*l[[i]][j,5] * 2734 + 1.811 #Ray5 lower
+       #k_600[j] <- (velocity[j]*l[[i]][j,5])^0.75 * 929 *  q[j]^0.011 #Ray6
+      #k_600[j] <- (velocity[j]*l[[i]][j,5])^0.78 * 788 *  q[j]^0.027 #Ray6 lower
+      #k_600[j] <- (velocity[j]*l[[i]][j,5])^0.86 * 4725 * q[j]^-0.14 * depth[j]^0.66 #Ray 7
+    #k_600[j] <- (velocity[j]*l[[i]][j,5])^0.88 * 4280 * q[j]^-0.128 * depth[j]^0.689 #Ray 7 lower
+      #k_600[j] <- exp(3.89 + 0.43*log(9.8*l[[length(l)]][j,5]) + 0.31*log(velocity[j]) + 0.52*log(depth[j]))
+      
+      #Ulseth et al. 2010    
+      #if(is.na(eD[j])) {}
+      #else if(eD[j] <= 0.02) k_600[j] = exp(3.10+0.35*log(eD[j]))
+      #else k_600[j] = exp(6.43+1.18*log(eD[j]))
+      
+      #Adjustment for k600 based on NEON rearation experiments 
+      #k_600[j] <- k_600[j] / 8 
+      
+       #Set SCHMIDT NUMBER BASED ON ORDER 
+      sc <- temp$sc[1]
+      ### CONVERT K_600 TO K_CO2 BASED ON SCHMIDT NUMBER
+      k_co2[j] <- k_600[j]/(600/sc)^-0.5
+      k_co2[j] <- (k_co2[j]/depth[j])/(24*60*60)
+      #k_co2 is 0 unless q > x
+      if (is.na(q[j])){
+        k_co2[j] <- k_co2[j]
+      }else if (q[j] <= Qthresh){ #0.0005  
+        k_co2[j] <- 0
+      }else{
+        k_co2[j] <- k_co2[j]
+      }
+      #k_co2 is 0 if snow = S
+      if (snow[j] == "S"){
+        k_co2[j] <- 0
+      }else{
+        k_co2[j] <- k_co2[j]
+      }
+      #C_gw = C_gw unless snow = W then C_gw = C_gwb
+      if (snow[j] == "W"){
+        C_gw <- C_gwb
+      }else{
+        C_gw <- CC_gw
+      }
+      ### CALCULATE CO2 CONCENTRATION BASED ON BACKWARDS DIFFERENCE METHOD OF REACTIVE TRANSPORT MODEL
+     c_back[j] <- (c_back[j-1] +( q[j] - q[j-1] )/velocity[j]*1/(width[j]*depth[j])*C_gw + l[[i]][j,8]/velocity[j]*k_co2[j]*C_atm)/(1+( q[j] - q[j-1] )/velocity[j]*1/(width[j]*depth[j])+l[[i]][j,8]/velocity[j]*k_co2[j])
+
+ c_back_2[j] <- (c_back_2[j-1] +( q[j] - q[j-1] )/velocity[j]*1/(width[j]*depth[j])*C_gw + l[[i]][j,8]/velocity[j]*k_co2[j]*C_atm+ l[[i]][j,8]/velocity[j]*nep/depth[j]/1000)/(1+( q[j] - q[j-1] )/velocity[j]*1/(width[j]*depth[j])+l[[i]][j,8]/velocity[j]*k_co2[j])
+
+ c_back_3[j] <-  (c_back_2[j-1] +( q[j] - q[j-1] )/velocity[j]*1/(width[j]*depth[j])*C_gw +  l[[i]][j,8]/velocity[j]*nep/depth[j]/1000)/(1+( q[j] - q[j-1] )/velocity[j]*1/(width[j]*depth[j])+l[[i]][j,8]/velocity[j]*k_co2[j])
+
+ c_back_4[j] <- (( q[j] - q[j-1] )/velocity[j]*1/(width[j]*depth[j])*C_gw)/(1+( q[j] - q[j-1] )/velocity[j]*1/(width[j]*depth[j])+l[[i]][j,8]/velocity[j]*k_co2[j])
+      
+      }
+    #### STORE ALL THE DATA CALCULATED IN THE MASTER LIST
+    l[[i]] <- cbind(l[[i]], q, area, velocity, depth, width, c_back, k_co2, c_back_2,snow,km,order, c_back_3, c_back_4)
+  }
+  
+  ### ALL THE OTHER STREAM SEGMENTS NEED TO CALCULATE Q, AND CO2 BASED ON MASS-WEIGHTED AVERAGE OF CONTRIBUTING STREAM SEGMENTS
+  else{
+    x <- dis <- ar <- carb <- carb_2 <- carb_3 <- carb_4 <- order <- array(dim = 0)
+    for(j in 1:length(l)){ ### LOOP THROUGH ALL THE REACHES THAT HAVE BEEN RUN
+      # if coordinates 
+      if(table[which(table[,4] == names[i])[1], 1] == l[[j]][dim(l[[j]])[1],1] & table[which(table[,4] == names[i])[1], 2] == l[[j]][dim(l[[j]])[1],2]){
+        x <- c(x,j)
+        dis <- c(dis,l[[j]][dim(l[[j]])[1],12] )
+        ar <- c(ar,l[[j]][dim(l[[j]])[1],13])
+        carb <- c(carb, l[[j]][dim(l[[j]])[1],17])
+        carb_2 <- c(carb_2,l[[j]][dim(l[[j]])[1],19])
+        carb_3 <- c(carb_3,l[[j]][dim(l[[j]])[1],23])
+        carb_4 <- c(carb_4,l[[j]][dim(l[[j]])[1],24])
+        order <- c(order,l[[j]][dim(l[[j]])[1],22])
+      }} 
+    
+    l <- append(l, list(table[which(table[,4] == names[i]),1:11])) #append data to master list 
+    snow <- q <- area <- width <- velocity <- depth <- c_back <- c_back_2 <- eD <- k_600 <- k_co2 <- u <- scz <- km <- c_back_3 <- c_back_4 <- array(dim = length(which(table[,4] == names[i]))) # set empty arrays for calculations
+    #q[1] <- sum(dis, na.rm = T) # set initial discharge to the sum of contributing stream discharge
+    
+   
+    c_back[1] <- sum((carb*dis)/sum(dis, na.rm = T), na.rm = T) # set initial co2 to the discharge weighted co2 of contributing streams
+    c_back_2[1] <- sum((carb_2*dis)/sum(dis, na.rm = T), na.rm = T) # set initial co2 to the discharge weighted co2 of contributing streams
+    c_back_3[1] <- sum((carb_3*dis)/sum(dis, na.rm = T), na.rm = T) # set initial co2 to the discharge weighted co2 of contributing streams
+    
+    c_back_4[1] <- sum((carb_4*dis)/sum(dis, na.rm = T), na.rm = T) # set initial co2 to the discharge weighted co2 of contributing streams
+    
+    area <- array(sum(c(ar, table[which(table[,4] == names[i])[1],7]), na.rm = T), dim = length(area)) # set area equal to total contributing area -- will sum through iterations so bottom stream reach has an area of 85 km2
+    q[1] <- (area[1]-l[[i]][1,7])*10^6*ERQ / Era
+   
+    snow <- table[which(table[,4]==names[i]),9]
+    snow <- as.character(snow)
+    order_tabel<-order[order==max(order)]
+    if(length(order_tabel)>=2){
+      order<-max(order)+1
+    }else{
+      order<-max(order)
+    }
+    
+    ### run the model over the reach
+    for(k in 2:length(q)){
+      q[k] <- ((area[1]-l[[i]][1,7]) + (l[[i]][k,7])*(l[[i]][k,11]))*10^6*ERQ / Era #Using conservation of mass and total catchment area + fraction of current catchment area 
+      ##Horgby
+      velocity[k] <- 0.668*q[k]^0.365
+      depth[k] <- 0.298*q[k]^0.222
+      width[k] <- q[k]/velocity[k]/depth[k]
+      #August correction factor
+      if(month == "aug") { width[k] <- (width[k] *  8.5680) - 0.7614 } 
+      if(is.na(width[k]) < 0) {width[k] = 0.008387081}
+      #### Surface Renewal Theory Mass Transfer Coefficient
+      u[k] <- sqrt(9.8*depth[k]*l[[i]][k,5])
+      scz[k] <- 1.3e-6/1.6e-9
+      km[k] <- 0.17*u[k]*scz[k]^(-2/3)
+      ########
+      eD[k] <- 9.8*l[[length(l)]][k,5]*velocity[k]
+      
+   
+      
+       #Equations to calculate k_600 - can select which one to use by removing comment. The paper uses Ray3_lower.
+       #k_600[k] <-  ((velocity[k]*l[[length(l)]][k,5])^0.89*depth[k]^0.54*5037)  #Ray 1
+       #k_600[k] <-  ((velocity[k]*l[[length(l)]][k,5])^0.91*depth[k]^0.57*4433)  #Ray 1_lower
+      #k_600[k] <- 5937 * (velocity[k]*l[[length(l)]][k,5])^0.89 * depth[k]^0.58 * (1- 2.54 *   (velocity[k]/(depth[k]*9.8)^0.5)) #Ray 2 
+      #k_600[k] <- 5331 * (velocity[k]*l[[length(l)]][k,5])^0.91 * depth[k]^0.61 * (1- 2.32 *   (velocity[k]/(depth[k]*9.8)^0.5)) #Ray 2_lower
+      #k_600[k] <- 1162 * l[[i]][k,5]^0.77 * velocity[k]^0.85 #Ray3
+      k_600[k] <- 970 * l[[i]][k,5]^0.798 * velocity[k]^0.895  #Ray3_lower
+      #k_600[k] <- 951.5 * (velocity[k]*l[[i]][k,5])^0.76 #Ray4 
+      #k_600[k] <- 807.5 * (velocity[k]*l[[i]][k,5])^0.787 #Ray4 lower
+      #k_600[k] <- velocity[k]*l[[i]][k,5] * 2841 + 0.209 #Ray5 
+      #k_600[k] <- velocity[k]*l[[i]][k,5] * 2734 + 1.811 #Ray5 lower
+      #k_600[k] <- (velocity[k]*l[[i]][k,5])^0.75 * 929 *  q[k]^0.011 #Ray6
+      #k_600[k] <- (velocity[k]*l[[i]][k,5])^0.78 * 788 *  q[k]^0.027 #Ray6 lower
+      #k_600[k] <- (velocity[k]*l[[i]][k,5])^0.86 * 4725 * q[k]^-0.14 * depth[k]^0.66 #Ray 7
+      #k_600[k] <- (velocity[k]*l[[i]][k,5])^0.88 * 4280 * q[k]^-0.128 * depth[k]^0.689 #Ray 7 lower
+      #k_600[k] <- exp(3.89 + 0.43*log(9.8*l[[length(l)]][k,5]) + 0.31*log(velocity[k]) + 0.52*log(depth[k]))#new model
+       
+      #Ulseth equation for k600 
+      #if(is.na(eD[k])){}
+      #else if(eD[k] <= 0.02) k_600[k] <- exp(3.1 + 0.35*log(eD[k]))
+      #else k_600[k] <- exp(6.43 + 1.18*log(eD[k]))
+      
+
+      
+      ####
+      sc <- temp$sc[temp$order==order] #Set schmidt number based on order/temperature
+      KH <- temp$KH[temp$order==order] #Set KH based on order/temperature
+      
+      CC_gw <- groundwater * 10^-6 * KH #Set groundwater CO2 based on order/temperature 
+      C_atm <- 400*10^-6*KH #mol/l  SETS ATMOSPHERIC CO2 based on order/temperature 
+      
+      k_co2[k] <- k_600[k]/(600/sc)^-0.5
+      k_co2[k] <- k_co2[k]/depth[k]/(24*60*60) #converts from m/day to s^-1 
+      #k_co2 is 0 unless q > x
+      if (is.na(q[k])){
+        k_co2[k] <- k_co2[k]
+      }else if (q[k] <= Qthresh){
+        k_co2[k] <- 0
+      }else{
+        k_co2[k] <- k_co2[k]
+      }
+      #k_co2 is 0 if snow = S
+      if (snow[k] == "S"){
+        k_co2[k] <- 0
+      }else{
+        k_co2[k] <- k_co2[k]
+      }
+      #C_gw = C_gw unless snow = W then C_gw = C_gwb
+      if (snow[k] == "W"){
+        C_gw <- C_gwb
+      }else{
+        C_gw <- CC_gw
+      }
+  
+          
+ c_back[k] <- (c_back[k-1]+(q[k] - q[k-1] )/velocity[k]*1/(width[k]*depth[k])*C_gw + l[[length(l)]][k,8]/velocity[k]*k_co2[k]*C_atm)/(1+(q[k] - q[k-1]  )/velocity[k]*1/(width[k]*depth[k])+ l[[length(l)]][k,8]/velocity[k]*k_co2[k])
+
+
+c_back_2[k] <- (c_back_2[k-1]+(q[k] - q[k-1]  )/velocity[k]*1/(width[k]*depth[k])*C_gw + l[[length(l)]][k,8]/velocity[k]*k_co2[k]*C_atm + l[[length(l)]][k,8]/velocity[k]*nep/depth[k]/1000)/(1+(q[k] - q[k-1]  )/velocity[k]*1/(width[k]*depth[k]) + l[[length(l)]][k,8]/velocity[k]*k_co2[k])
+
+ c_back_3[k] <- (c_back_3[k-1]+(q[k] - q[k-1]  )/velocity[k]*1/(width[k]*depth[k])*C_gw +  l[[length(l)]][k,8]/velocity[k]*nep/depth[k]/1000)/(1+(q[k] - q[k-1]  )/velocity[k]*1/(width[k]*depth[k]) + l[[length(l)]][k,8]/velocity[k]*k_co2[k])
+
+  c_back_4[k] <- ((q[k] - q[k-1] )/velocity[k]*1/(width[k]*depth[k])*C_gw)/(1+(q[k] - q[k-1]  )/velocity[k]*1/(width[k]*depth[k])+ l[[length(l)]][k,8]/velocity[k]*k_co2[k])
+
+      
+     }
+    ## store the data in the master list
+    l[[length(l)]] <- cbind(l[[length(l)]], q, area, velocity, depth, width, c_back, k_co2, c_back_2,snow,km,order, c_back_3, c_back_4)
+  }}
+
+######## you can look at the data structure using the head() function on table and l[[1]] (i.e. head(l[[1]]))
+######## list has columns of Lon, Lat, Elevation, Stream Reach ID, Slope, NHD ID, Reach Area, delta_l - distance between points (m), dA - change in area per change in stream length, discharge, total upstream area, velocity, depth, width, calculated co2, and co2 exchange velocity (need to check if in velocity or 1/time units)
+
+#### pull out data from list into array to be able to plot it all at once
+cback <- k_600 <- ar <- k <- lamda <- dq<- array(dim = dim(table)[1])
+n = 1
+for(i in 1:length(l)){
+  colnames(l[[i]])[13] <- "d_area"
+  l[[i]] <- merge(l[[i]], temp, "order")
+  l[[i]] <- l[[i]] %>% relocate(order, .before = temperature)
+  for(j in 1:dim(l[[i]])[1]){
+    cback[n] <- l[[i]][j,17]/l[[i]][j,27]*10^6
+    k_600[n] <- l[[i]][j,18]*(600/l[[i]][j,28])^-0.5 * 24 * 3600
+    k[n] <- l[[i]][j,18]
+    #ar[n] <- l[[i]][j,9]/(l[[i]][j,17]*l[[i]][j,18])
+    #dq[n] <- l[[i]][j,9]
+    lamda[n] <- k[n]/(l[[i]][j,14])
+    q[n]<-l[[i]][j,12]
+    n <- n+1
+  }}
+
+half_life <- log(2)/lamda
+
+### calculate theoretical steady-state pco2
+#c_ss <- ((ar*(groundwater*0.0533/10^6) + k*C_atm)/(ar+k))/0.0533*10^6
+
+#### plot up colored points over map to represent pCO2 scale
+n = 20 
+scale <- seq(min(q,na.rm = TRUE), max(q,na.rm = TRUE), length.out = n)
+col = tim.colors(n = n)
+plot(hill, col=grey(0:100/100), legend = F, ylim = c(45.765,45.805), xlim = c(-122.98,-121.92))
+for(i in 1:length(l)){
+  for(j in 1:dim(l[[i]])[1]){
+    points(l[[i]][j,1], l[[i]][j,2], pch = 21, col = col[which(abs(l[[i]][j,12] - scale) == min(abs(l[[i]][j,12] - scale)))])
+  }}
+legend('bottomleft', as.character(signif(scale,2)), pch = 21, col = col)
+
+```
+
+This portion of the model saves an output to be used in the adjusted model. A graph of the fit to field measurements will be printed at the end.
+
+```{r}
+pointsdata <- read.table(paste0('pointsdata',month,'.csv'), sep = ',', header = T, fill = TRUE) #import sample data, change based on month
+names(pointsdata)[names(pointsdata) == 'CO2_ppm'] <- "ppm.in.water"
+
+df <- data.frame(matrix(ncol = 25, nrow = 0))
+x <- c("Longmodel", "Latmodel", "cback","Q","k","k_600","velocity","slope","nhd_ID","ID","elevation","cback2","snow","delta_1","depth","width","km","order", "area", "KH", "cback3", "cback5", "sc", "k_600_m_day", "cback2_umol_L")
+colnames(df) <- x
+n=1
+#added one to l[[i]][j,x] where x>=10
+for(i in 1:length(l)){
+  for(j in 1:dim(l[[i]])[1]){
+    df[n,1] <- l[[i]][j,1]
+    df[n,2] <- l[[i]][j,2]
+    df[n,3] <- l[[i]][j,17]/l[[i]][j,27]*10^6
+    df[n,4] <- l[[i]][j,12]
+    df[n,5] <- l[[i]][j,18]
+    df[n,6] <- l[[i]][j,18]*(600/l[[i]][j,28])^-0.5 #1/sec 
+    df[n,7] <- l[[i]][j,14]
+    df[n,8] <- l[[i]][j,5]
+    df[n,9] <- l[[i]][j,6]
+    df[n,10] <- n
+    df[n,11] <- l[[i]][j,3]
+    df[n,12] <- l[[i]][j,19]/l[[i]][j,27]*10^6
+    df[n,13] <- as.character(l[[i]][j,20])
+    #df[n,14] <- l[[i]][j,23]/l[[i]][j,29]*10^6
+    df[n,14] <- l[[i]][j,8]
+    df[n,15] <- l[[i]][j,15]
+    df[n,16] <- l[[i]][j,16]
+    df[n,17] <- l[[i]][j,21]
+    df[n,18] <- l[[i]][j,24]
+    df[n,19] <- l[[i]][j,13]
+    df[n,20] <- l[[i]][j,27]
+    df[n,21] <- l[[i]][j,22]/l[[i]][j,27]*10^6
+    df[n,22] <- l[[i]][j,23]/l[[i]][j,27]*10^6
+    df[n,23] <- l[[i]][j,28]
+    df[n,24] <- l[[i]][j,18]*(600/l[[i]][j,28])^-0.5 * 24 * 3600 * l[[i]][j,15]
+     df[n,25] <- l[[i]][j,19]*10^6 #umol/L 
+    n<-n+1
+  }}
+#write.csv(df[,10:13],'dforder.csv')
+df$cback4<-df$cback2
+
+
+#KH<-0.0533 set in previous model, changed to be set by temp 
+CO2_atm <- 400/1000000 #ppm to atm
+CO2_sat <- CO2_atm * df$KH # CO2 saturation (mol/L) | equation
+
+#Fluxes all  
+DCO2_1 <- (((df$cback2/1000000)*df$KH)-(CO2_sat))*1000
+fluxesall <- df$k*df$delta_1*df$depth*df$width*DCO2_1  #(mol/s)
+
+df <- cbind(df,fluxesall)
+
+DCO2_2 <- (((df$cback/1000000)*df$KH)-(CO2_sat))*1000
+fluxesGW <- df$k*df$delta_1*df$depth*df$width*DCO2_2  #(mol/s)
+df <- cbind(df,fluxesGW)
+
+#Fluxes due to internal production 
+fluxesBZ <- fluxesall-fluxesGW  #(mol/s)
+df <- cbind(df,fluxesBZ)
+
+DCO2_3 <- (((df$cback3/1000000)*df$KH)-(CO2_sat))*1000
+fluxes_GW_only <- df$k*df$delta_1*df$depth*df$width*DCO2_3  #(mol/s)
+df <- cbind(df,fluxes_GW_only)
+
+#Fluxes due to gas transfer coefficient  
+fluxesgas <- fluxesall-fluxes_GW_only  #(mol/s)
+df <- cbind(df,fluxesgas)
+
+#fluxes kg C/m^2/day (kg of C emited by each m^2 of stream each day) - All
+df$fluxes_kgC_m2_day<-df$fluxesall*12/1000 #(kg/s) 
+df$fluxes_kgC_m2_day<-df$fluxes_kgC_m2_day*60*60*24 #(kg/day)
+df$fluxes_kgC_day<-df$fluxes_kgC_m2_day
+df$fluxes_kgC_m2_day<-df$fluxes_kgC_m2_day/(df$width*df$delta_1) #(kg/m2/day)
+
+#fluxes GW kg C/m^2/day (kg of C emited by each m^2 of stream each day) - Groundwater 
+df$fluxesGW_kgC_m2_day<-df$fluxesGW*12/1000 #(kg/s)
+df$fluxesGW_kgC_m2_day<-df$fluxesGW_kgC_m2_day*60*60*24 #(kg/day)
+df$fluxesGW_kgC_day<-df$fluxesGW_kgC_m2_day
+df$fluxesGW_kgC_m2_day<-df$fluxesGW_kgC_m2_day/(df$width*df$delta_1) #(kg/m2/day)
+
+#fluxes in-stream metabolism kg C/m^2/day (kg of C emited by each m^2 of stream each day) - Internal Production  
+df$fluxesBZ_kgC_m2_day<-df$fluxesBZ*12/1000 #(kg/s)
+df$fluxesBZ_kgC_m2_day<-df$fluxesBZ_kgC_m2_day*60*60*24 #(kg/day)
+df$fluxesBZ_kgC_day<-df$fluxesBZ_kgC_m2_day
+df$fluxesBZ_kgC_m2_day<-df$fluxesBZ_kgC_m2_day/(df$width*df$delta_1) #(kg/m2/day)
+
+#fluxes in-stream metabolism kg C/m^2/day (kg of C emited by each m^2 of stream each day) - Gas Transfer  
+df$fluxesgas_kgC_m2_day<-df$fluxesgas*12/1000 #(kg/s)
+df$fluxesgas_kgC_m2_day<-df$fluxesgas_kgC_m2_day*60*60*24 #(kg/day)
+df$fluxesgas_kgC_day<-df$fluxesgas_kgC_m2_day
+df$fluxesgas_kgC_m2_day<-df$fluxesgas_kgC_m2_day/(df$width*df$delta_1) #(kg/m2/day)
+
+
+headids <- merge(headids, stream_reach, by = "Permanent_Identifier")
+
+df$resp_per <- (df$cback2-df$cback)/(df$cback2)*100
+df$gas_per <- (df$cback2-df$cback3)/(df$cback2)*100
+df$gw_per <- (df$cback-(df$cback2-df$cback3))/(df$cback2)*100
+
+#add data to the sampled data frame
+pointsdata[ , x] <- NA
+d <- pointDistance(pointsdata[,6:5], df[,1:2], lonlat=TRUE, allpairs=T)  
+i <- apply(d, 1, which.min)
+
+pointsdata$distance = d[cbind(1:nrow(d), i)]
+pointsdata$Longmodel <- df$Longmodel[i]
+pointsdata$Latmodel <- df$Latmodel[i]
+pointsdata$cback <- df$cback[i]
+pointsdata$Q <- df$Q[i]
+pointsdata$k <- df$k[i]
+pointsdata$k_600 <- df$k_600[i]
+pointsdata$k_600_m_day <- df$k_600_m_day[i]
+pointsdata$velocity <- df$velocity[i]
+pointsdata$diff <- pointsdata$cback-pointsdata$ppm.in.water
+pointsdata$slope <- df$slope[i]
+pointsdata$nhd_ID <- df$nhd_ID[i]
+pointsdata$ID <- df$ID[i]
+pointsdata$elevation <- df$elevation[i]
+pointsdata$landscape <- df$landscape[i]
+pointsdata$NPP <- df$NPP[i]
+pointsdata$cback2 <- df$cback2[i]
+pointsdata$cback2_umol_L <- df$cback2_umol_L[i]
+pointsdata$snow <- df$snow[i]
+pointsdata$diff2 <- pointsdata$cback2-pointsdata$ppm.in.water
+pointsdata$km <- df$km[i]
+pointsdata$order <- df$order[i]
+pointsdata$depth <- df$depth[i]
+pointsdata$width <- df$width[i]
+pointsdata$delta_1 <- df$delta_1[i]
+pointsdata$order <- df$order[i]
+pointsdata$area <- df$area[i]
+pointsdata$KH <- df$KH[i]
+
+pointsdata$ppm.in.water_umol_L <- pointsdata$ppm.in.water*pointsdata$KH
+pointsdata$diff_mol_L <- pointsdata$cback2_umol_L-pointsdata$ppm.in.water_umol_L
+
+pointsDataAll <- pointsdata
+pointsdata$cback4 <- df$cback4[i]
+
+library(dplyr)
+
+
+pointsdatafinal <- pointsdata
+
+#remove points that are more than 50 m away - don't do for now check later 
+out<-c()
+for(i in 1:length(pointsdatafinal$distance)){
+  if (is.na(pointsdatafinal[i,"distance"])){
+  }else if(pointsdatafinal[i,"distance"]>50){# 
+    out <- c(out,i)
+  }
+}
+
+
+#check model correlations
+library(mltools)
+
+res <- cor.test(log(pointsdatafinal$ppm.in.water),log(pointsdatafinal$cback4), 
+                method = "pearson")
+res
+
+my.formula <- y ~ x
+library(ggpmisc)
+
+
+ggplot(pointsdatafinal, aes(x = (ppm.in.water_umol_L), y = (cback2_umol_L))) + 
+  geom_point() + 
+  #geom_text(hjust = 0, vjust = -0.5) + 
+  # geom_label_repel(aes(label = Sample),
+  #                 box.padding   = 0.35, 
+  #                 point.padding = 0.5,
+  #                 segment.color = 'grey50') + 
+  geom_smooth(method = "lm", se=FALSE, color="black", formula = my.formula) +
+  stat_poly_eq(formula = my.formula, 
+                aes(label = paste(..rr.label.., sep = "~~~")), 
+                parse = TRUE) +
+  ylab(expression("Modeled Concentration")) +
+    xlab("Measured Concentration") +
+  theme(panel.background = element_rect(fill=NA, color = NA),
+        plot.margin=unit(c(1,1,0,1), "cm"),
+        axis.text=element_text(size=12),
+        axis.title=element_text(size=14)) +
+  ggtitle(month) 
+
+
+comparison_plot <- ggplot(pointsdatafinal) +
+  aes(x = ppm.in.water, y = cback4) +
+  #scale_y_continuous(breaks=c(2500, 5000, 10000),limits=c(200,12500)) +
+  #scale_x_continuous(breaks=c(1000, 2000, 3000, 4000),limits=c(200,4500)) +
+  scale_y_continuous(trans = "log",breaks=c(100,500, 1000, 2000, 5000, 10000),limits=c(400,12500)) +
+  scale_x_continuous(trans = "log",breaks=c(100,500, 1000, 2000, 5000, 10000),limits=c(300,6000)) +
+   #geom_smooth(method = "lm", se=FALSE, color="grey", formula = my.formula) +
+  #stat_poly_eq(formula = my.formula, 
+                #aes(label = paste(..rr.label.., sep = "~~~")), 
+                #parse = TRUE) +
+  geom_point(size = 4L, colour = "#0c4c8a", shape = 1, type = 3) +
+  labs(x =expression(paste("\nObserved CO"[2]*" (ppm)")),y =expression(paste("Predicted CO"[2]*" (ppm)"))) +
+   theme_minimal() +
+   geom_abline(intercept = 0, slope = 1, color="grey", 
+              linetype="solid", size=1)+
+   theme(legend.position = "none",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill=NA, color = NA),
+        strip.background = element_rect(fill=NA, color=NA),
+        axis.line = element_line()) +
+   theme(axis.text = element_text(size= 22),axis.title = element_text(size = 18),
+         plot.title = element_text(size = 22)) 
+  #ggtitle("August")
+
+comparison_plot 
+
+comparison_plot_mol <- ggplot(pointsdatafinal) +
+  aes(x = ppm.in.water_umol_L, y = cback2_umol_L) +
+  #scale_y_continuous(breaks=c(2500, 5000, 10000),limits=c(200,12500)) +
+  #scale_x_continuous(breaks=c(1000, 2000, 3000, 4000),limits=c(200,4500)) +
+  scale_y_continuous(trans = "log",breaks=c(20, 100,200, 400, 600), limits = c(20,600)) +
+  scale_x_continuous(trans = "log",breaks=c(20, 100,200, 400, 600), limits = c(20,600)) +
+   #geom_smooth(method = "lm", se=FALSE, color="grey", formula = my.formula) +
+  #stat_poly_eq(formula = my.formula, 
+                #aes(label = paste(..rr.label.., sep = "~~~")), 
+                #parse = TRUE) +
+  geom_point(size = 4L, colour = "#0c4c8a", shape = 1, type = 3) +
+  labs(x =expression(paste("\nObserved CO"[2]*" (μmol/L)")),y =expression(paste("Predicted CO"[2]*" (μmol/L)"))) +
+   theme_minimal() +
+   geom_abline(intercept = 0, slope = 1, color="grey", 
+              linetype="solid", size=1)+
+   theme(legend.position = "none",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill=NA, color = NA),
+        strip.background = element_rect(fill=NA, color=NA),
+        axis.line = element_line()) +
+   theme(axis.text = element_text(size= 22),axis.title = element_text(size = 18),
+         plot.title = element_text(size = 22)) 
+  #ggtitle("August")
+
+comparison_plot_mol 
+
+jpeg(file=paste0("/Users/Hannah/Library/CloudStorage/OneDrive-UW/NEON Data/Papers/Martha_Creek/Figures/comparison_plot_mol",month,".jpeg"),width=7, height=5,
+     units="in", res=300, pointsize=10)
+print(comparison_plot_mol)
+dev.off()
+
+
+cbackopt<-df$cback
+pointcbackopt<-pointsdatafinal$cback
+
+gw_inputs <- subset(pointsdatafinal, select=c(Latmodel,Longmodel,ppm.in.water,cback2))
+gw_inputs$c_add <- gw_inputs$ppm.in.water
+gw_inputs$c_add <- gw_inputs$c_add * pointsdatafinal$KH/10^6
+#gw_inputs <- subset(gw_inputs, c_add > 0 )
+gw_inputs <- subset(gw_inputs, select=c(Longmodel,Latmodel,c_add))
+colnames(gw_inputs) <- c("coords.x1", "coords.x2", "c_add" )
+
+
+
+```
+
+This chunk is used to compared k within the original model.
+
+```{r}
+#Other methods for calculating k600 - a comparison 
+
+k6 <- as.data.frame(9.8*df$velocity*df$slope) #eD  
+colnames(k6) <- "Ulseth" #original model equation 
+
+k6$Ulseth <- ifelse(k6$Ulseth > 0.02, exp(1.18 * log(k6$Ulseth) + 6.43), exp(0.35 * log(k6$Ulseth) + 3.10))
+
+#Raymond et al. 2012 - models and bounds
+#Model 1 
+k6$ray1 <- ((df$velocity*df$slope)^0.89*df$depth^0.54*5037)
+k6$ray1_lower <- ((df$velocity*df$slope)^0.91*df$depth^0.57*4433)
+#k6$ray1_higher <- ((df$velocity*df$slope)^0.87*df$depth^0.54*5641)
+#Model 2
+k6$ray2 <- 5937 * (df$velocity*df$slope)^0.89 * df$depth^0.58 * (1- 2.54 *   (df$velocity/(df$depth*9.8)^0.5))
+k6$ray2_lower <- 5331 * (df$velocity*df$slope)^0.907 * df$depth^0.607 * (1- 2.32 *   (df$velocity/(df$depth*9.8)^0.5)) 
+#k6$ray2_lower <- 6543 * (df$velocity*df$slope)^0.873 * df$depth^0.553 * (1- 2.76 *   (df$velocity/(df$depth*9.8)^0.5)) 
+#Model 3 
+k6$ray3 <- (1162 * df$slope^0.77 * df$velocity^0.85)
+k6$ray3_lower <- (970 * df$slope^0.798 * df$velocity^0.95)
+#k6$ray3_higher<- (1354 * df$slope^0.77 * df$velocity^0.805)
+#Model 4
+k6$ray4 <- (951.5 * (df$velocity*df$slope)^0.76 ) 
+k6$ray4_lower <- (807.5 * (df$velocity*df$slope)^0.787 )
+#k6$ray4_higher <- (1096 * (df$velocity*df$slope)^0.733 )
+#Model 5 
+k6$ray5 <- (df$velocity*df$slope * 2841 + 0.209) 
+k6$ray5_lower <- (df$velocity*df$slope * 2734 + 1.811) 
+#k6$ray5_higher <- (df$velocity*df$slope * 2948 + 2.229) 
+#Model 6
+k6$ray6 <- ((df$velocity*df$slope)^0.75 * 929 * df$Q^0.011)
+k6$ray6_lower <- ((df$velocity*df$slope)^0.777 * 788 * df$Q^0.027)
+#k6$ray6_higher <- ((df$velocity*df$slope)^0.723 * 1070 * df$Q^-0.005)
+#Model 7 
+#k6$ray7 <- ((df$velocity*df$slope)^0.86 * 4725 * df$Q^-0.14 * df$depth^0.66)
+k6$ray7_lower <- ((df$velocity*df$slope)^0.876 * 4280 * df$Q^-0.128 * df$depth^0.689)
+#k6$ray7_higher <- ((df$velocity*df$slope)^0.844 * 5170 * df$Q^-0.152 * df$depth^0.631)
+#Model_8 
+k6$newmodel <- exp(3.89 + 0.43*log(9.8*df$slope) + 0.31*log(df$velocity) + 0.52*log(df$depth))
+
+boxplot(k6, ylab = "k600 (m/day)")
+
+
+
+min <- apply(k6,2,min, na.rm = TRUE)
+max <- apply(k6,2,max, na.rm = TRUE)
+mean <- apply(k6,2,mean, na.rm = TRUE)
+
+summary <- data.frame(min, max, mean)
+
+summary
+
+#November sensor k600 
+mean_novsensor <- apply(k6[966:989,],2,mean, na.rm = TRUE)
+mean_novsensor <- data.frame(mean_novsensor) 
+#Compare to NEON m.day = 9.94 m.day 
+
+#August sensor k600 
+mean_augsensor <- apply(k6[396:420,],2,mean, na.rm = TRUE)
+mean_augsensor  <- data.frame(mean_augsensor) 
+#Compare to NEON m.day = 2.12 m.day 
+
+```
+
+This model will run by setting the points that correspond to field data equal to the measured concentrations. This model can be skipped and can run the figures/outputs on original model below.
+
+```{r}
+### MARTHA CREEK NETWORK MODEL
+# libraries 
+rm(list=ls()[! ls() %in% c("gw_inputs", "resp_add", "cbackopt","pointcbackopt", "month", "dem", "map", "lines", "stream_reach", "catchment", "PI", "nep", "groundwater", "ERQ")])
+require(rgdal)
+library(raster)
+library(geosphere)
+library(fields)
+
+Qthresh <- 0.000 
+C_gwb <- 0 #wetland CO2 - not used in this model
+
+
+## CALCULATE CATCHMENT SLOPE, ASPECT, AND HILLSHADE MAPS
+slope <- terrain(dem)
+aspect <- terrain(dem, opt = 'aspect')
+hill <- hillShade(slope, aspect)
+
+########## #slope method###########################
+area_slope <- terrain(dem, opt = 'slope', unit = 'radians') #make slope dem #dem is an imported digital elevation model, any one you have should work and it is loaded with raster 
+library(sf) #import library
+setCRS <- st_crs(dem) #make a variable that has the same CRS and the dem
+class(setCRS) #make sure the class is crs
+pointsall<- as.data.frame(map@coords)#this is the locations you want slopes of
+pointsdata_sp <- st_as_sf(pointsall, coords = c("coords.x1", "coords.x2"), crs = setCRS) #set up point data
+sites_vals <- extract(area_slope,
+                      pointsdata_sp,
+                      buffer = 5,
+                      fun = mean,
+                      sp = TRUE) # extract the mean values w/in a 2m radius around each point
+st_crs(sites_vals) # check its crs
+plot(sites_vals) # plot points should look like the stream layout
+slope<-sites_vals$slope # the point by point slope
+slope<-tan(slope) # convert slope into decimal not %
+write.csv(slope,'slopetable.csv')
+###################################################
+
+#calculated in supplemental code 
+slope<-read.csv('slopetable.csv',header = T)
+
+for(i in 1:length(slope)){
+  if(slope[i,1] == 0){
+    slope[i,1] <- 0.01716722 #lowest slope predicted in model
+  }else{
+    slope[i,1] <- slope[i,1]
+  }
+}
+
+### ELEVATIONS OF VERTICES
+#.rs.unloadPackage("tidyr") #if needed 
+e <- extract(dem, coordinates(map)[,-3])
+### MAKE A TABLE OF COORDINATES, ELEVATIONS
+table <- coordinates(map)[,-3]
+table <- cbind(table, e)
+
+### EXTRACT STREAM REACH ID'S AND ADD TO OVERALL TABLE
+plusId <- array(dim = length(map$LengthKM))
+for(i in 1:length(plusId)){
+  plusId[i] <- toString(map$Permanent_Identifier[i])
+}
+table <- cbind(table,as.numeric(plusId))
+ids <- as.numeric(unique(plusId))
+
+n_ids <- array(dim = length(as.numeric(plusId)))
+for(i in 1:length(n_ids)){
+  n_ids[i] <- stream_reach$NHDPlusID[which(stream_reach$Permanent_Identifier == as.numeric(plusId[i]))]
+}
+
+### CALCULATE DISTANCE BETWEEN POINTS WITHIN EACH REACH
+## FIRST CREATE SPACE TO STORE THIS DATA
+total_length <- array(dim = length(ids))
+delta_l <- array(dim = dim(table)[1])
+total_l <- array(dim = dim(table)[1])
+
+### LOOP THROUGH EACH INDIVIDUAL STREAM REACH
+for(i in 1:length(ids)){
+  reach <- table[which(table[,4] == ids[i]),] # PULL OUT POINTS FOR THE CURRENT STREAM REACH
+  de <- dl <- dls <- array(dim = dim(reach)[1]) # SET EMPTY ARRAYS TO STORE CHANGE IN ELEVATION/LENGTH DATA, total length along reach
+  for(j in 2:dim(reach)[1]){    # LOOP THROUGH POINTS IN THE CURRENT STREAM REACH
+    de[j] <- reach[j,3] - reach[j-1,3]  # CALCULATE THE DIFFERENCE IN ELEVATION BETWEEN POINTS
+    dl[j] <- distm(reach[j,1:2], reach[j-1,1:2])  # CALCULATE THE DISTANCE BETWEEN POINTS
+    dls[j] <- ifelse(is.na(dls[j-1]), 0, dls[j-1]) + dl[j]
+    #slope[which(table[,4] == ids[i])] <- -de/dl   # CALCULATE THE SLOPE BETWEEN POINTS     #used point slope
+  }
+  delta_l[which(table[,4]==ids[i])] <- dl    # STORE THE DATA IN THE EMPTY ARRAY CREATED BEFORE THE LOOP
+  total_l[which(table[,4]==ids[i])] <- dls
+  total_length[i] <- sum(dl, na.rm = T)      # STORE THE DATA IN THE EMPTY ARRAY CREATED BEFORE THE LOOP
+}
+
+### ADD SLOPES TO DATATABLE
+table <- cbind(table, slope[2])
+
+### EXTRACTS CATCHMENT AREAS AND PUTS THEM IN THE SAME ORDER AS THE STREAM REACH DATA
+reach_area <- array(dim = dim(stream_reach)[1])
+for(i in 1:length(reach_area)){
+  if(length(which(catchment$NHDPlusID == stream_reach$NHDPlusID[i])) > 0){
+  reach_area[i] <- catchment$AreaSqKm[which(catchment$NHDPlusID == stream_reach$NHDPlusID[i])]
+}}
+
+#### IDENTIFY HEADWATERS BY SEEING WHICH ONES DON'T HAVE
+#### THEIR FIRST POINT INCLUDED IN ANOTHER REACH
+#### IF HEAD = 1, THEN IT'S A HEADWATERS STREAM
+head <- array(dim = length(ids))
+for(i in 1:length(ids)){
+  reach <- table[which(table[,4] == ids[i]),]
+  x <- which(table[,1] == reach[1,1] & table[,2] == reach[1,2])
+    head[i] = length(x)
+}
+#headwater + IDS
+headids <- cbind(head,ids)
+colnames(headids)[2] <- "Permanent_Identifier"
+#colnames(headids)[2] <- "New_Identifier"
+#headids <- merge(headids, PI, by="New_Identifier")
+
+hn <- length(which(head == "1"))
+
+nhd_id <- array(dim = dim(table)[1])
+for(i in 1:length(nhd_id)){
+  nhd_id[i] <- stream_reach$NHDPlusID[which(stream_reach$Permanent_Identifier == table[i,4])]
+}
+
+#### ADD TO THE OVERALL TABLE
+table <- cbind(table, nhd_id)
+
+#### INCORPORATE CATCHMENT AREA INTO THE OVERALL TABLE
+area <- array(dim = dim(table)[1])
+for(i in 1:length(area)){
+  if(length(which(catchment$NHDPlusID == table[i,6])) > 0)
+  area[i] <- catchment$AreaSqKm[which(catchment$NHDPlusID == table[i,6])]
+}
+table <- cbind(table,area)
+
+#### CURRENTLY ASSUMES that headwaters streams start at 50% of the area of the reach
+
+#### set conditions for the basin
+#calculate Henry's constant 
+A <- 108.3865# constant 
+B <- 0.01985076 # constant 
+C <- -6919.53 # constant 
+D <- -40.4515 # constant 
+E <- 669365 # constant 
+
+#Read in temperature file with temperatures set by stream order (from sample data)
+temp <- read_xlsx("/Users/Hannah/OneDrive - UW/NEON Data/Stream_Network/Spatial Files_MART/temp.xlsx", sheet = month) 
+temp$TK <- temp$temperature + 273.15 #Kelvins
+temp$KH <- 10^(A+B*temp$TK+C/temp$TK+D*log10(temp$TK)+E/temp$TK^2) #KH for each temp
+temp$sc <- 1911-118.11*temp$temperature+3.453*temp$temperature^2-0.0413*temp$temperature^3 
+
+#Area at stream gauge 
+if(month == "aug") {
+Era = 1380000 #m^2 
+} else {
+Era = 3107000 #m^2  
+} #Sets area for stream gauge based on month. Units are m^2.  
+
+table <- cbind(table,delta_l)
+
+# bring in bog and snow locations - NA for Martha Creek in August and September 
+table$loca <- "N"
+
+table <- cbind(table,total_l)
+
+#Calculate fraction of length for each point on each stream reach - to be used for flow calculation  
+area_fraction <- array(dim = dim(table)[1])
+for(i in 1:length(ids)){
+  reach <- table[which(table[,4] == ids[i]),] # PULL OUT POINTS FOR THE CURRENT STREAM REACH
+  daf <- array(dim = dim(reach)[1]) # SET EMPTY ARRAYS TO STORE AREA FRACTION
+  daf[1] <- 0
+  for(j in 2:dim(reach)[1]){    # LOOP THROUGH POINTS IN THE CURRENT STREAM REACH
+    daf[j] <- reach[j,10]/reach[dim(reach)[1],10]  # CALCULATE THE area fraction of each reach
+  }
+  area_fraction[which(table[,4]==ids[i])] <- daf    # STORE THE DATA IN THE EMPTY ARRAY CREATED BEFORE THE LOOP
+}
+
+table <- cbind(table,area_fraction)
+
+library(dplyr)
+
+headids <- data.frame(headids)
+#CODE TO CREATE NAMES FROM HYDROSEQUENCE - puts stream IDs in correct order to run 
+names <- subset(stream_reach, select=c(Permanent_Identifier,HydrologicSequence, StreamOrder))
+names <- merge(names, headids, by = "Permanent_Identifier")
+names$HydrologicSequence <- ifelse(names$head == 1, 55500400271606, names$HydrologicSequence)
+names <-  names[order(-names$HydrologicSequence),] #sort descending
+names <- subset(names, select=c(Permanent_Identifier))
+names <- as.integer(names[,1])
+
+table <- table %>% full_join(gw_inputs)
+table$c_add[is.na(table$c_add)] <- 0
+
+l <- list() 
+for(i in 1:length(names)){
+  ### FIRST XX STREAM SEGEMENTS ARE HEADWATERS - NEED TO SET INITIAL Q, AREA, AND CO2
+  if(i <= hn){
+    l <- append(l, list(table[which(table[,4] == names[i]),1:12]))
+    snow <- q <- area <- width <- velocity <- depth <- c_back <- c_back_2 <- eD<- k_600<- k_co2 <- u <- km <- scz <- c_back_3 <- c_back_4 <- c_back_5 <- array(dim = length(which(table[,4] == names[i])))
+    
+    
+    #Using conservation of mass - initial Qi = Qg * Ai / Ag, units are m/s
+    #table[,7] is drainage area of stream section in km^2 (divided by two - assumes starts at half of catchment) * 10^6 m * ERQ (discharge at stream gauge (m^3/s)) / Era (drainage area at stream gauge (m^2). 
+     q[1] <- (l[[i]][1,7]/2)*10^6*ERQ / Era #m/s 
+    
+    area <- table[which(table[,4]==names[i]),7]
+    
+    KH <- temp$KH[1] #set KH based on order/temperature
+    CC_gw <- groundwater * 10^-6 *KH 
+    C_atm <- 400*10^-6*KH #mol/l  SETS ATMOSPHERIC CO2
+    
+    snow <- table[which(table[,4]==names[i]),9] 
+    snow <- as.character(snow)
+    order <- 1
+    c_back[1] <- c_back_2[1] <-  c_back_3[1] <- CC_gw #### SET THE INITIAL BOUNDARY CONDITION AS GW CO2 VALUES
+    #c_back[1] <- c_back_2[1] <-  c_back_3[1] <- 0
+    c_back_4[1] <- 0 
+    c_back_5[1] <- 0 
+    for(j in 2:length(q)){  ### LOOP THROUGH ALL THE POINTS IN THE STREAM REACH
+      
+      ### CALCULATE DISCHARGE AT NEW POINT BASED ON PREVIOUS POINT AND CHANGE IN AREA 
+      q[j] <- (l[[i]][j,7]/2 + (l[[i]][j,7]/2)*(l[[i]][j,11]))*10^6*ERQ / Era #Using conservation of mass - initial Qi = Qg * Ai / Ag, units are m/. Ai is calculated based on area fraction along stream. 
+      ##Horgby
+      velocity[j] <- 0.668*q[j]^0.365
+      depth[j] <- 0.298*q[j]^0.222
+      width[j] <- q[j]/velocity[j]/depth[j]
+        #August correction factor
+      if(month == "aug") { width[j] <- (width[j] *  8.5680) - 0.7614 } 
+      if((width[j]) < 0) {width[j] = 0.008387081}
+      #### Surface Renewal Theory Mass Transfer Coefficient
+      u[j] <- sqrt(9.8*depth[j]*l[[i]][j,5])
+      scz[j] <- 1.3e-6/1.6e-9
+      km[j] <- 0.17*u[j]*scz[j]^(-2/3)
+      ### METRIC OF STREAM TURBULENCE FOR CALCULATING GAS TRANSFER VELOCITY
+      eD[j] <- 9.8*velocity[j]*l[[i]][j,5]
+      ### USES THIS METRIC TO CALCULATE K_600
+    
+      
+       #Equation to calculate k_600
+        k_600[j] <- 970 * l[[i]][j,5]^0.798 * velocity[j]^0.895  #Ray3_lower
+        
+         
+           #Equations to calculate k_600 - these can be used to compare results. The paper uses Ray 3 lower. Make sure to change one below as well.
+      #k_600[j] <-  ((velocity[j]*l[[length(l)]][j,5])^0.89*depth[j]^0.54*5037) #Ray 1
+      #k_600[j] <-  ((velocity[j]*l[[length(l)]][j,5])^0.91*depth[j]^0.57*4433) #Ray 1_lower
+    #k_600[j] <- 5937 * (velocity[j]*l[[length(l)]][j,5])^0.89 * depth[j]^0.58 * (1- 2.54 *   (velocity[j]/(depth[j]*9.8)^0.5))  #Ray_2
+       #k_600[j] <- 5331 * (velocity[j]*l[[length(l)]][j,5])^0.91 * depth[j]^0.61 * (1- 2.32 *   (velocity[j]/(depth[j]*9.8)^0.5)) #Ray 2_lower
+      #k_600[j] <- 1162 * l[[i]][j,5]^0.77 * velocity[j]^0.85 #Ray3
+      #k_600[j] <- 970 * l[[i]][j,5]^0.798 * velocity[j]^0.895 #Ray3_lower
+      #k_600[j] <- 951.5 * (velocity[j]*l[[i]][j,5])^0.76 #Ray4
+      #k_600[j] <- 807.5 * (velocity[j]*l[[i]][j,5])^0.787 #Ray4 lower
+      #k_600[j] <- velocity[j]*l[[i]][j,5] * 2841 + 0.209 #Ray5 
+      #k_600[j] <- velocity[j]*l[[i]][j,5] * 2734 + 1.811 #Ray5 lower
+       #k_600[j] <- (velocity[j]*l[[i]][j,5])^0.75 * 929 *  q[j]^0.011 #Ray6
+      #k_600[j] <- (velocity[j]*l[[i]][j,5])^0.78 * 788 *  q[j]^0.027 #Ray6 lower
+      #k_600[j] <- (velocity[j]*l[[i]][j,5])^0.86 * 4725 * q[j]^-0.14 * depth[j]^0.66 #Ray 7
+    #k_600[j] <- (velocity[j]*l[[i]][j,5])^0.88 * 4280 * q[j]^-0.128 * depth[j]^0.689 #Ray 7 lower
+      
+      #Ulseth equation 2019 - originally used in model 
+      #if(is.na(eD[j])) {}
+      #else if(eD[j] <= 0.02) k_600[j] = exp(3.10+0.35*log(eD[j]))
+      #else k_600[j] = exp(6.43+1.18*log(eD[j]))
+       #Set SCHMIDT NUMBER BASED ON ORDER 
+      sc <- temp$sc[1]
+      ### CONVERT K_600 TO K_CO2 BASED ON SCHMIDT NUMBER
+      k_co2[j] <- k_600[j]/(600/sc)^-0.5
+      k_co2[j] <- (k_co2[j]/depth[j])/(24*60*60)
+      #k_co2 is 0 unless q > x
+      if (is.na(q[j])){
+        k_co2[j] <- k_co2[j]
+      }else if (q[j] <= Qthresh){ #0.0005  
+        k_co2[j] <- 0
+      }else{
+        k_co2[j] <- k_co2[j]
+      }
+      #k_co2 is 0 if snow = S
+      if (snow[j] == "S"){
+        k_co2[j] <- 0
+      }else{
+        k_co2[j] <- k_co2[j]
+      }
+      #C_gw = C_gw unless snow = W then C_gw = C_gwb
+      if (snow[j] == "W"){
+        C_gw <- C_gwb
+      }else{
+        C_gw <- CC_gw
+      }
+     
+      ### CALCULATE CO2 CONCENTRATION BASED ON BACKWARDS DIFFERENCE METHOD OF REACTIVE TRANSPORT MODEL
+   if (l[[i]][j,12] != 0){
+     c_back[j] <- l[[i]][j,12]
+    c_back_2[j] <- l[[i]][j,12]
+    c_back_3[j] <- l[[i]][j,12]
+   }else{
+       c_back[j] <- (c_back[j-1] +( q[j] - q[j-1] )/velocity[j]*1/(width[j]*depth[j])*C_gw + l[[i]][j,8]/velocity[j]*k_co2[j]*C_atm)/(1+( q[j] - q[j-1] )/velocity[j]*1/(width[j]*depth[j])+l[[i]][j,8]/velocity[j]*k_co2[j])
+
+ c_back_2[j] <- (c_back_2[j-1] +( q[j] - q[j-1] )/velocity[j]*1/(width[j]*depth[j])*C_gw + l[[i]][j,8]/velocity[j]*k_co2[j]*C_atm+ l[[i]][j,8]/velocity[j]*nep/depth[j]/1000)/(1+( q[j] - q[j-1] )/velocity[j]*1/(width[j]*depth[j])+l[[i]][j,8]/velocity[j]*k_co2[j]) 
+
+ c_back_3[j] <-  (c_back_2[j-1] +( q[j] - q[j-1] )/velocity[j]*1/(width[j]*depth[j])*C_gw +  l[[i]][j,8]/velocity[j]*nep/depth[j]/1000)/(1+( q[j] - q[j-1] )/velocity[j]*1/(width[j]*depth[j])+l[[i]][j,8]/velocity[j]*k_co2[j])
+
+   }
+ c_back_4[j] <- (l[[i]][j,8]/velocity[j]*nep/depth[j]/1000)/(1+( q[j] - q[j-1] )/velocity[j]*1/(width[j]*depth[j])+l[[i]][j,8]/velocity[j]*k_co2[j]) 
+ 
+ c_back_5[j] <- (l[[i]][j,8]/velocity[j]*k_co2[j]*C_atm)/(1+( q[j] - q[j-1] )/velocity[j]*1/(width[j]*depth[j])+l[[i]][j,8]/velocity[j]*k_co2[j]) 
+      
+      }
+    #### STORE ALL THE DATA CALCULATED IN THE MASTER LIST
+    l[[i]] <- cbind(l[[i]], q, area, velocity, depth, width, c_back, k_co2, c_back_2,snow,km,order, c_back_3, c_back_4, c_back_5)
+  }
+  
+  ### ALL THE OTHER STREAM SEGMENTS NEED TO CALCULATE Q, AND CO2 BASED ON MASS-WEIGHTED AVERAGE OF CONTRIBUTING STREAM SEGMENTS
+  else{
+    x <- dis <- ar <- carb <- carb_2 <- carb_3 <- carb_4 <- carb_5 <- order <- array(dim = 0)
+    for(j in 1:length(l)){ ### LOOP THROUGH ALL THE REACHES THAT HAVE BEEN RUN
+      # if coordinates 
+      if(table[which(table[,4] == names[i])[1], 1] == l[[j]][dim(l[[j]])[1],1] & table[which(table[,4] == names[i])[1], 2] == l[[j]][dim(l[[j]])[1],2]){
+        x <- c(x,j)
+        dis <- c(dis,l[[j]][dim(l[[j]])[1],13] )
+        ar <- c(ar,l[[j]][dim(l[[j]])[1],14])
+        carb <- c(carb, l[[j]][dim(l[[j]])[1],18])
+        carb_2 <- c(carb_2,l[[j]][dim(l[[j]])[1],20])
+        carb_3 <- c(carb_3,l[[j]][dim(l[[j]])[1],24])
+        carb_4 <- c(carb_4,l[[j]][dim(l[[j]])[1],25])
+        carb_5 <- c(carb_5,l[[j]][dim(l[[j]])[1],26])
+        order <- c(order,l[[j]][dim(l[[j]])[1],23])
+      }} 
+    
+    l <- append(l, list(table[which(table[,4] == names[i]),1:12])) #append data to master list 
+    snow <- q <- area <- width <- velocity <- depth <- c_back <- c_back_2 <- eD <- k_600 <- k_co2 <- u <- scz <- km <- c_back_3 <- c_back_4 <- c_back_5 <- array(dim = length(which(table[,4] == names[i]))) # set empty arrays for calculations
+    #q[1] <- sum(dis, na.rm = T) # set initial discharge to the sum of contributing stream discharge
+    
+   
+    c_back[1] <- sum((carb*dis)/sum(dis, na.rm = T), na.rm = T) + l[[i]][1,12]# set initial co2 to the discharge weighted co2 of contributing streams
+    c_back_2[1] <- sum((carb_2*dis)/sum(dis, na.rm = T), na.rm = T) + l[[i]][1,12]# set initial co2 to the discharge weighted co2 of contributing streams
+    c_back_3[1] <- sum((carb_3*dis)/sum(dis, na.rm = T), na.rm = T) + l[[i]][1,12] # set initial co2 to the discharge weighted co2 of contributing streams
+    
+    c_back_4[1] <- 0 # set initial co2 to the discharge weighted co2 of contributing streams
+    
+    c_back_5[1] <- sum((carb_5*dis)/sum(dis, na.rm = T), na.rm = T) # set initial co2 to the discharge weighted co2 of contributing streams
+    
+    
+    area <- array(sum(c(ar, table[which(table[,4] == names[i])[1],7]), na.rm = T), dim = length(area)) # set area equal to total contributing area -- will sum through iterations so bottom stream reach has an area of 85 km2
+    q[1] <- (area[1]-l[[i]][1,7])*10^6*ERQ / Era
+   
+    snow <- table[which(table[,4]==names[i]),9]
+    snow <- as.character(snow)
+    order_tabel<-order[order==max(order)]
+    if(length(order_tabel)>=2){
+      order<-max(order)+1
+    }else{
+      order<-max(order)
+    }
+    
+    ### run the model over the reach
+    for(k in 2:length(q)){
+      q[k] <- ((area[1]-l[[i]][1,7]) + (l[[i]][k,7])*(l[[i]][k,11]))*10^6*ERQ / Era #Using conservation of mass and total catchment area + fraction of current catchment area 
+      ##Horgby
+      velocity[k] <- 0.668*q[k]^0.365
+      depth[k] <- 0.298*q[k]^0.222
+      width[k] <- q[k]/velocity[k]/depth[k]
+      #August correction factor
+      if(month == "aug") { width[k] <- (width[k] *  8.5680) - 0.7614 } 
+      if(is.na(width[k]) < 0) {width[k] = 0.008387081}
+      #### Surface Renewal Theory Mass Transfer Coefficient
+      u[k] <- sqrt(9.8*depth[k]*l[[i]][k,5])
+      scz[k] <- 1.3e-6/1.6e-9
+      km[k] <- 0.17*u[k]*scz[k]^(-2/3)
+      ########
+      eD[k] <- 9.8*l[[length(l)]][k,5]*velocity[k]
+      #Calculate k600
+      k_600[k] <- 970 * l[[i]][k,5]^0.798 * velocity[k]^0.895  #Ray3_lower
+      
+      #Equations to calculate k_600 - can select which one to use by removing comment. The paper uses Ray3_lower.
+      #k_600[k] <-  ((velocity[k]*l[[length(l)]][k,5])^0.89*depth[k]^0.54*5037)  #Ray 1
+       #k_600[k] <-  ((velocity[k]*l[[length(l)]][k,5])^0.91*depth[k]^0.57*4433)  #Ray 1_lower
+      #k_600[k] <- 5937 * (velocity[k]*l[[length(l)]][k,5])^0.89 * depth[k]^0.58 * (1- 2.54 *   (velocity[k]/(depth[k]*9.8)^0.5)) #Ray 2 
+      #k_600[k] <- 5331 * (velocity[k]*l[[length(l)]][k,5])^0.91 * depth[k]^0.61 * (1- 2.32 *   (velocity[k]/(depth[k]*9.8)^0.5)) #Ray 2_lower
+      #k_600[k] <- 1162 * l[[i]][k,5]^0.77 * velocity[k]^0.85 #Ray3
+      #k_600[k] <- 970 * l[[i]][k,5]^0.798 * velocity[k]^0.895  #Ray3_lower
+      #k_600[k] <- 951.5 * (velocity[k]*l[[i]][k,5])^0.76 #Ray4 
+      #k_600[k] <- 807.5 * (velocity[k]*l[[i]][k,5])^0.787 #Ray4 lower
+      #k_600[k] <- velocity[k]*l[[i]][k,5] * 2841 + 0.209 #Ray5 
+      #k_600[k] <- velocity[k]*l[[i]][k,5] * 2734 + 1.811 #Ray5 lower
+      #k_600[k] <- (velocity[k]*l[[i]][k,5])^0.75 * 929 *  q[k]^0.011 #Ray6
+      #k_600[k] <- (velocity[k]*l[[i]][k,5])^0.78 * 788 *  q[k]^0.027 #Ray6 lower
+      #k_600[k] <- (velocity[k]*l[[i]][k,5])^0.86 * 4725 * q[k]^-0.14 * depth[k]^0.66 #Ray 7
+      #k_600[k] <- (velocity[k]*l[[i]][k,5])^0.88 * 4280 * q[k]^-0.128 * depth[k]^0.689 #Ray 7 lower
+      
+      
+      #Ulseth et al. 2019 - used in the original model 
+      #if(is.na(eD[k])){}
+      #else if(eD[k] <= 0.02) k_600[k] <- exp(3.1 + 0.35*log(eD[k]))
+      #else k_600[k] <- exp(6.43 + 1.18*log(eD[k]))
+      ####
+      sc <- temp$sc[temp$order==order] #Set schmidt number based on order/temperature
+      KH <- temp$KH[temp$order==order] #Set KH based on order/temperature
+      
+      CC_gw <- groundwater * 10^-6 * KH #Set groundwater CO2 based on order/temperature 
+      C_atm <- 400*10^-6*KH #mol/l  SETS ATMOSPHERIC CO2 based on order/temperature 
+      
+      k_co2[k] <- k_600[k]/(600/sc)^-0.5
+      k_co2[k] <- k_co2[k]/depth[k]/(24*60*60) #converts from m/day to s^-1 
+      #k_co2 is 0 unless q > x
+      if (is.na(q[k])){
+        k_co2[k] <- k_co2[k]
+      }else if (q[k] <= Qthresh){
+        k_co2[k] <- 0
+      }else{
+        k_co2[k] <- k_co2[k]
+      }
+      #k_co2 is 0 if snow = S
+      if (snow[k] == "S"){
+        k_co2[k] <- 0
+      }else{
+        k_co2[k] <- k_co2[k]
+      }
+      #C_gw = C_gw unless snow = W then C_gw = C_gwb
+      if (snow[k] == "W"){
+        C_gw <- C_gwb
+      }else{
+        C_gw <- CC_gw
+      }
+      
+  if (l[[length(l)]][k,12] != 0){
+     c_back[k] <- l[[length(l)]][k,12]
+    c_back_2[k] <- l[[length(l)]][k,12]
+    c_back_3[k] <- l[[length(l)]][k,12]
+  }else{
+c_back[k] <- (c_back[k-1]+(q[k] - q[k-1] )/velocity[k]*1/(width[k]*depth[k])*C_gw + l[[length(l)]][k,8]/velocity[k]*k_co2[k]*C_atm)/(1+(q[k] - q[k-1]  )/velocity[k]*1/(width[k]*depth[k])+ l[[length(l)]][k,8]/velocity[k]*k_co2[k]) + l[[length(l)]][k,12]
+
+
+c_back_2[k] <- (c_back_2[k-1]+(q[k] - q[k-1]  )/velocity[k]*1/(width[k]*depth[k])*C_gw + l[[length(l)]][k,8]/velocity[k]*k_co2[k]*C_atm + l[[length(l)]][k,8]/velocity[k]*nep/depth[k]/1000)/(1+(q[k] - q[k-1]  )/velocity[k]*1/(width[k]*depth[k]) + l[[length(l)]][k,8]/velocity[k]*k_co2[k]) + l[[length(l)]][k,12]
+
+ c_back_3[k] <- (c_back_3[k-1]+(q[k] - q[k-1]  )/velocity[k]*1/(width[k]*depth[k])*C_gw +  l[[length(l)]][k,8]/velocity[k]*nep/depth[k]/1000)/(1+(q[k] - q[k-1]  )/velocity[k]*1/(width[k]*depth[k]) + l[[length(l)]][k,8]/velocity[k]*k_co2[k]) + l[[length(l)]][k,12]
+}
+  c_back_4[k] <- (l[[length(l)]][k,8]/velocity[k]*nep/depth[k]/1000)/(1+(q[k] - q[k-1]  )/velocity[k]*1/(width[k]*depth[k]) + l[[length(l)]][k,8]/velocity[k]*k_co2[k]) + l[[length(l)]][k,12]
+  
+    c_back_5[k] <- (l[[length(l)]][k,8]/velocity[k]*k_co2[k]*C_atm)/(1+(q[k] - q[k-1]  )/velocity[k]*1/(width[k]*depth[k]) + l[[length(l)]][k,8]/velocity[k]*k_co2[k]) + l[[length(l)]][k,12]
+      
+     }
+    ## store the data in the master list
+    l[[length(l)]] <- cbind(l[[length(l)]], q, area, velocity, depth, width, c_back, k_co2, c_back_2,snow,km,order, c_back_3, c_back_4, c_back_5)
+  }}
+
+######## you can look at the data structure using the head() function on table and l[[1]] (i.e. head(l[[1]]))
+######## list has columns of Lon, Lat, Elevation, Stream Reach ID, Slope, NHD ID, Reach Area, delta_l - distance between points (m), dA - change in area per change in stream length, discharge, total upstream area, velocity, depth, width, calculated co2, and co2 exchange velocity (need to check if in velocity or 1/time units)
+
+#### pull out data from list into array to be able to plot it all at once
+cback <- k_600 <- ar <- k <- lamda <- dq<- array(dim = dim(table)[1])
+n = 1
+for(i in 1:length(l)){
+  colnames(l[[i]])[14] <- "d_area"
+  l[[i]] <- merge(l[[i]], temp, "order")
+  l[[i]] <- l[[i]] %>% relocate(order, .before = temperature)
+  for(j in 1:dim(l[[i]])[1]){
+    cback[n] <- l[[i]][j,18]/l[[i]][j,29]*10^6
+    k_600[n] <- l[[i]][j,19]*(600/l[[i]][j,30])^-0.5
+    k[n] <- l[[i]][j,19]
+    #ar[n] <- l[[i]][j,9]/(l[[i]][j,17]*l[[i]][j,18])
+    #dq[n] <- l[[i]][j,9]
+    lamda[n] <- k[n]/(l[[i]][j,15])
+    q[n]<-l[[i]][j,13]
+    n <- n+1
+  }}
+
+half_life <- log(2)/lamda
+
+### calculate theoretical steady-state pco2
+#c_ss <- ((ar*(groundwater*0.0533/10^6) + k*C_atm)/(ar+k))/0.0533*10^6
+
+#### plot up colored points over map to represent pCO2 scale
+n = 20 
+scale <- seq(min(q,na.rm = TRUE), max(q,na.rm = TRUE), length.out = n)
+col = tim.colors(n = n)
+plot(hill, col=grey(0:100/100), legend = F, ylim = c(45.765,45.805), xlim = c(-122.98,-121.92))
+for(i in 1:length(l)){
+  for(j in 1:dim(l[[i]])[1]){
+    points(l[[i]][j,1], l[[i]][j,2], pch = 21, col = col[which(abs(l[[i]][j,13] - scale) == min(abs(l[[i]][j,13] - scale)))])
+  }}
+legend('bottomleft', as.character(signif(scale,2)), pch = 21, col = col)
+
+
+```
+
+This portion of the model saves the final output of the model in dataframe df with the adjusted field measurements.
+
+```{r}
+pointsdata <- read.table(paste0('pointsdata',month,'.csv'), sep = ',', header = T, fill = TRUE) #import sample data, change based on month
+names(pointsdata)[names(pointsdata) == 'CO2_ppm'] <- "ppm.in.water"
+
+df <- data.frame(matrix(ncol = 25, nrow = 0))
+x <- c("Longmodel", "Latmodel", "cback","Q","k","k_600","velocity","slope","nhd_ID","ID","elevation","cback2","snow","delta_1","depth","width","km","order", "area", "KH", "cback3", "cback5", "sc", "c_add", "cback2_umol_L")
+colnames(df) <- x
+n=1
+#added one to l[[i]][j,x] where x>=10
+for(i in 1:length(l)){
+  for(j in 1:dim(l[[i]])[1]){
+    df[n,1] <- l[[i]][j,1]
+    df[n,2] <- l[[i]][j,2]
+    df[n,3] <- l[[i]][j,18]/l[[i]][j,29]*10^6
+    df[n,4] <- l[[i]][j,13]
+    df[n,5] <- l[[i]][j,19]
+    df[n,6] <- l[[i]][j,19]*(600/l[[i]][j,30])^-0.5
+    df[n,7] <- l[[i]][j,15]
+    df[n,8] <- l[[i]][j,5]
+    df[n,9] <- l[[i]][j,6]
+    df[n,10] <- n
+    df[n,11] <- l[[i]][j,3]
+    df[n,12] <- l[[i]][j,20]/l[[i]][j,29]*10^6
+    df[n,13] <- as.character(l[[i]][j,21])
+    #df[n,14] <- l[[i]][j,23]/l[[i]][j,29]*10^6
+    df[n,14] <- l[[i]][j,8]
+    df[n,15] <- l[[i]][j,16]
+    df[n,16] <- l[[i]][j,17]
+    df[n,17] <- l[[i]][j,22]
+    df[n,18] <- l[[i]][j,26]
+    df[n,19] <- l[[i]][j,14]
+    df[n,20] <- l[[i]][j,29]
+    df[n,21] <- l[[i]][j,23]/l[[i]][j,29]*10^6
+    df[n,22] <- l[[i]][j,24]/l[[i]][j,29]*10^6
+    df[n,23] <- l[[i]][j,30]
+    df[n,24] <- l[[i]][j,12]/l[[i]][j,29]*10^6
+    df[n,25] <- l[[i]][j,20]*10^6
+    n<-n+1
+  }}
+#write.csv(df[,10:13],'dforder.csv')
+df$cback4<-df$cback2
+
+
+#KH<-0.0533 set in previous model, changed to be set by temp 
+CO2_atm <- 400/1000000 #ppm to atm
+CO2_sat <- CO2_atm * df$KH # CO2 saturation (mol/L) | equation
+
+#Fluxes all  
+DCO2_1 <- (((df$cback2/1000000)*df$KH)-(CO2_sat))*1000
+fluxesall <- df$k*df$delta_1*df$depth*df$width*DCO2_1  #(mol/s)
+
+df <- cbind(df,fluxesall)
+
+DCO2_2 <- (((df$cback/1000000)*df$KH)-(CO2_sat))*1000
+fluxesGW <- df$k*df$delta_1*df$depth*df$width*DCO2_2  #(mol/s)
+df <- cbind(df,fluxesGW)
+
+#Fluxes due to internal production 
+fluxesBZ <- fluxesall-fluxesGW  #(mol/s)
+df <- cbind(df,fluxesBZ)
+
+DCO2_3 <- (((df$cback3/1000000)*df$KH)-(CO2_sat))*1000
+fluxes_GW_only <- df$k*df$delta_1*df$depth*df$width*DCO2_3  #(mol/s)
+df <- cbind(df,fluxes_GW_only)
+
+#Fluxes due to gas transfer coefficient  
+fluxesgas <- fluxesall-fluxes_GW_only  #(mol/s)
+df <- cbind(df,fluxesgas)
+
+#fluxes kg C/m^2/day (kg of C emited by each m^2 of stream each day) - All
+df$fluxes_kgC_m2_day<-df$fluxesall*12/1000 #(kg/s) 
+df$fluxes_kgC_m2_day<-df$fluxes_kgC_m2_day*60*60*24 #(kg/day)
+df$fluxes_kgC_day<-df$fluxes_kgC_m2_day
+df$fluxes_kgC_m2_day<-df$fluxes_kgC_m2_day/(df$width*df$delta_1) #(kg/m2/day)
+
+#fluxes GW kg C/m^2/day (kg of C emited by each m^2 of stream each day) - Groundwater 
+df$fluxesGW_kgC_m2_day<-df$fluxesGW*12/1000 #(kg/s)
+df$fluxesGW_kgC_m2_day<-df$fluxesGW_kgC_m2_day*60*60*24 #(kg/day)
+df$fluxesGW_kgC_day<-df$fluxesGW_kgC_m2_day
+df$fluxesGW_kgC_m2_day<-df$fluxesGW_kgC_m2_day/(df$width*df$delta_1) #(kg/m2/day)
+
+#fluxes in-stream metabolism kg C/m^2/day (kg of C emited by each m^2 of stream each day) - Internal Production  
+df$fluxesBZ_kgC_m2_day<-df$fluxesBZ*12/1000 #(kg/s)
+df$fluxesBZ_kgC_m2_day<-df$fluxesBZ_kgC_m2_day*60*60*24 #(kg/day)
+df$fluxesBZ_kgC_day<-df$fluxesBZ_kgC_m2_day
+df$fluxesBZ_kgC_m2_day<-df$fluxesBZ_kgC_m2_day/(df$width*df$delta_1) #(kg/m2/day)
+
+#fluxes in-stream metabolism kg C/m^2/day (kg of C emited by each m^2 of stream each day) - Gas Transfer  
+df$fluxesgas_kgC_m2_day<-df$fluxesgas*12/1000 #(kg/s)
+df$fluxesgas_kgC_m2_day<-df$fluxesgas_kgC_m2_day*60*60*24 #(kg/day)
+df$fluxesgas_kgC_day<-df$fluxesgas_kgC_m2_day
+df$fluxesgas_kgC_m2_day<-df$fluxesgas_kgC_m2_day/(df$width*df$delta_1) #(kg/m2/day)
+
+#df$fluxesWC_kgC_m2_day<-df$fluxes_kgC_m2_day-df$fluxesGW_kgC_m2_day-df$fluxesBZ_kgC_m2_day
+#df$fluxesWC_kgC_day<-df$fluxes_kgC_day-df$fluxesGW_kgC_day-df$fluxesBZ_kgC_day
+
+headids <- merge(headids, stream_reach, by = "Permanent_Identifier")
+
+#add data to the sampled data frame
+pointsdata[ , x] <- NA
+d <- pointDistance(pointsdata[,6:5], df[,1:2], lonlat=TRUE, allpairs=T)  
+i <- apply(d, 1, which.min)
+
+pointsdata$distance = d[cbind(1:nrow(d), i)]
+pointsdata$Longmodel <- df$Longmodel[i]
+pointsdata$Latmodel <- df$Latmodel[i]
+pointsdata$cback <- df$cback[i]
+pointsdata$Q <- df$Q[i]
+pointsdata$k <- df$k[i]
+pointsdata$k_600 <- df$k_600[i]
+pointsdata$velocity <- df$velocity[i]
+pointsdata$diff <- pointsdata$cback-pointsdata$ppm.in.water
+pointsdata$slope <- df$slope[i]
+pointsdata$nhd_ID <- df$nhd_ID[i]
+pointsdata$ID <- df$ID[i]
+pointsdata$elevation <- df$elevation[i]
+pointsdata$landscape <- df$landscape[i]
+pointsdata$NPP <- df$NPP[i]
+pointsdata$cback2 <- df$cback2[i]
+pointsdata$snow <- df$snow[i]
+pointsdata$diff2 <- pointsdata$cback2-pointsdata$ppm.in.water
+pointsdata$km <- df$km[i]
+pointsdata$order <- df$order[i]
+pointsdata$depth <- df$depth[i]
+pointsdata$width <- df$width[i]
+pointsdata$delta_1 <- df$delta_1[i]
+pointsdata$order <- df$order[i]
+pointsdata$area <- df$area[i]
+pointsdata$KH <- df$KH[i]
+pointsdata$cback2_umol_L <- df$cback2_umol_L[i]
+
+pointsdata$ppm.in.water_umol_L <- pointsdata$ppm.in.water*pointsdata$KH
+pointsdata$diff_umol_L <- pointsdata$cback2_umol_L-pointsdata$ppm.in.water_umol_L
+
+pointsDataAll <- pointsdata
+
+#pointsdata <- pointsdata[,-c(28,36)]
+pointsdata$cback4 <- df$cback4[i]
+
+pointsdatafinal <- pointsdata
+
+#remove points that are more than 50 m away - don't do for now check later 
+out<-c()
+for(i in 1:length(pointsdatafinal$distance)){
+  if (is.na(pointsdatafinal[i,"distance"])){
+  }else if(pointsdatafinal[i,"distance"]>50){# 
+    out <- c(out,i)
+  }
+}
+
+##df <- df %>% full_join(resp_add)
+#df$resp_input[is.na(df$resp_input)] <- 0
+
+#df$resp_per <- ifelse(df$resp_input == 0, (df$cback2-df$cback)/(df$cback2)*100, (df$resp_input)/(df$cback2)*100) 
+#df$gw_per <- ifelse(df$resp_input == 0, (df$cback-(df$cback2-df$cback3))/(df$cback2)*100, (df$cback-(df$cback2-df$cback3))/(df$cback2)*100 - df$resp_per) 
+#df$gas_per <- (df$cback2-df$cback3)/(df$cback2)*100
+
+
+#check model correlations
+library(mltools)
+
+plot(log(pointsdatafinal$ppm.in.water),log(pointsdatafinal$cback4))
+abline(a=0, b=1)
+
+plot(pointsdatafinal$ppm.in.water,pointsdatafinal$cback4)
+
+
+res <- cor.test(log(pointsdatafinal$ppm.in.water),log(pointsdatafinal$cback4), 
+                method = "pearson")
+res
+
+my.formula <- y ~ x
+library(ggpmisc)
+
+ggplot(pointsdatafinal, aes(x = log(ppm.in.water), y = log(cback4))) + 
+  geom_point() + 
+  #geom_text(hjust = 0, vjust = -0.5) + 
+  # geom_label_repel(aes(label = Sample),
+  #                 box.padding   = 0.35, 
+  #                 point.padding = 0.5,
+  #                 segment.color = 'grey50') + 
+  geom_smooth(method = "lm", se=FALSE, color="black", formula = my.formula) +
+  stat_poly_eq(formula = my.formula, 
+                aes(label = paste(..rr.label.., sep = "~~~")), 
+                parse = TRUE) +
+  ylab(expression("Modeled Concentration")) +
+    xlab("Measured Concentration") +
+  theme(panel.background = element_rect(fill=NA, color = NA),
+        plot.margin=unit(c(1,1,0,1), "cm"),
+        axis.text=element_text(size=12),
+        axis.title=element_text(size=14)) +
+  ggtitle(month) 
+
+```
+
+Width comparison measured vs. modeled
+
+```{r}
+#Compare model results for width with real data 
+
+library(ggpmisc)
+library(ggrepel)
+
+width<- pointsdatafinal$Streamwidth_in * 0.0254
+width <- as.data.frame(width)
+width$model_width <- pointsdatafinal$width
+width$Sample <- pointsdatafinal$Sample
+width$Q <- pointsdatafinal$Q
+
+my.formula <- y ~ x
+
+ggplot(width, aes(x = width, y = model_width, label=Sample)) + 
+  geom_point() + 
+  #geom_text(hjust = 0, vjust = -0.5) + 
+  #geom_label_repel(aes(label = Sample),
+  #                box.padding   = 0.35, 
+   #               point.padding = 0.5,
+   #               segment.color = 'grey50') + 
+  geom_smooth(method = "lm", se=FALSE, color="black", formula = my.formula) +
+  stat_poly_eq(formula = my.formula, 
+                aes(label = paste(..rr.label.., sep = "~~~")), 
+                parse = TRUE) +
+  ylab(expression("Modeled Width (m)")) +
+    xlab("Measured Width (m)") +
+  theme(panel.background = element_rect(fill=NA, color = NA),
+        plot.margin=unit(c(1,1,0,1), "cm"),
+        axis.text=element_text(size=12),
+        axis.title=element_text(size=14)) 
+  #ggtitle("August") 
+
+
+res <- cor.test(width$width,width$model_width, 
+                method = "pearson")
+res
+
+
+```
+
+Results
+
+Field sampling results (Table XX)
+
+```{r}
+#pH
+print("pH")
+cat("min",min(pointsdatafinal$pH,na.rm = T))
+cat(" max",max(pointsdatafinal$pH,na.rm = T))
+cat(" mean",mean(pointsdatafinal$pH,na.rm = T))
+cat(" median",median(pointsdatafinal$pH,na.rm = T))
+print("")
+
+# temperature
+print("temperature")
+cat("min",min(pointsdatafinal$Temp_deg_C,na.rm = T))
+cat(" max",max(pointsdatafinal$Temp_deg_C,na.rm = T))
+cat(" mean",mean(pointsdatafinal$Temp_deg_C,na.rm = T))
+cat(" median",median(pointsdatafinal$Temp_deg_C,na.rm = T))
+print(" ")
+
+#alkalinity
+print("alkalinity")
+cat("min",min(pointsdatafinal$Alkalinity_meq_L,na.rm = T))
+cat(" max",max(pointsdatafinal$Alkalinity_meq_L,na.rm = T))
+cat(" mean",mean(pointsdatafinal$Alkalinity_meq_L,na.rm = T))
+cat(" median",median(pointsdatafinal$Alkalinity_meq_L,na.rm = T))
+print("")
+
+#DOC
+print("DOC")
+cat("min",min(pointsdatafinal$DOC_mg_L,na.rm = T))
+cat(" max",max(pointsdatafinal$DOC_mg_L,na.rm = T))
+cat(" mean",mean(pointsdatafinal$DOC_mg_L,na.rm = T))
+cat(" median",median(pointsdatafinal$DOC_mg_L,na.rm = T))
+print("")
+
+#DIC
+print("DIC")
+cat("min",min(pointsdatafinal$DIC_mg_L,na.rm = T))
+cat(" max",max(pointsdatafinal$DIC_mg_L,na.rm = T))
+cat(" mean",mean(pointsdatafinal$DIC_mg_L,na.rm = T))
+cat(" median",median(pointsdatafinal$DIC_mg_L,na.rm = T))
+print("")
+
+#DO mg/l
+print("DO mg/L")
+cat("min",min(pointsdatafinal$ODO._sat,na.rm = T))
+cat(" max",max(pointsdatafinal$ODO._sat,na.rm = T))
+cat(" mean",mean(pointsdatafinal$ODO._sat,na.rm = T))
+cat(" median",median(pointsdatafinal$ODO._sat,na.rm = T))
+print(" ")
+
+#DO mg/l
+print("DO mg/L")
+cat("min",min(pointsdatafinal$DO_percent,na.rm = T))
+cat(" max",max(pointsdatafinal$DO_percent,na.rm = T))
+cat(" mean",mean(pointsdatafinal$DO_percent,na.rm = T))
+cat(" median",median(pointsdatafinal$DO_percent,na.rm = T))
+print(" ")
+
+
+#pCO2
+print("pCO2")
+cat(" mean",mean(pointsdatafinal$ppm.in.water,na.rm = T))
+cat("min",min(pointsdatafinal$ppm.in.water,na.rm = T))
+cat(" max",max(pointsdatafinal$ppm.in.water,na.rm = T))
+cat(" median",median(pointsdatafinal$ppm.in.water,na.rm = T))
+print(" ")
+
+# Elevation 
+print("elevation")
+cat("min",min(pointsdatafinal$elevation,na.rm = T))
+cat(" max",max(pointsdatafinal$elevation,na.rm = T))
+cat(" mean",mean(pointsdatafinal$elevation,na.rm = T))
+cat(" median",median(pointsdatafinal$elevation,na.rm = T))
+print(" ")
+
+```
+
+Summary of model inputs (Table XX )
+
+```{r}
+# discharge
+print("discharge")
+cat("min",min(df$Q,na.rm = T))
+cat(" max",max(df$Q,na.rm = T))
+cat(" mean",mean(df$Q,na.rm = T))
+cat(" median",median(df$Q,na.rm = T))
+print(" ")
+
+print("Groundwater concentration (ppm)")
+groundwater
+print(" ")
+
+print("Distance between points")
+min(df$delta_1,na.rm=T)
+mean(df$delta_1,na.rm=T)
+max(df$delta_1,na.rm=T)
+median(df$delta_1,na.rm=T)
+
+print("Width")
+min(df$width,na.rm=T)
+mean(df$width,na.rm=T)
+max(df$width,na.rm=T)
+median(df$width,na.rm=T)
+
+print("Depth")
+min(df$depth,na.rm=T)
+mean(df$depth,na.rm=T)
+max(df$depth,na.rm=T)
+median(df$depth,na.rm=T)
+
+print("k600") #m/day
+min(df$k_600_m_day, na.rm=T) 
+max(df$k_600_m_day, na.rm=T)
+mean(df$k_600_m_day, na.rm=T)
+median(df$k_600_m_day, na.rm=T)
+
+print("kCO2") #m/day
+min(df$k*df$depth*24*60*60, na.rm = T) #m/day 
+max(df$k*df$depth*24*60*60, na.rm = T)
+mean(df$k*df$depth*24*60*60, na.rm = T)
+median(df$k*df$depth*24*60*60, na.rm = T)
+
+print("NEP")
+nep
+
+print("slope") #m/m
+min(df$slope, na.rm=T) 
+max(df$slope, na.rm=T)
+mean(df$slope, na.rm=T)
+median(df$slope, na.rm=T)
+
+print("temperature") #C
+min(temp$temperature)
+max(temp$temperature)
+mean(temp$temperature)
+median(temp$temperature)
+
+
+
+```
+
+Summary of measured points (CO2)
+
+```{r}
+#pCO2
+print("pCO2")
+cat(" mean",mean(pointsdatafinal$ppm.in.water,na.rm = T))
+cat("min",min(pointsdatafinal$ppm.in.water,na.rm = T))
+cat(" max",max(pointsdatafinal$ppm.in.water,na.rm = T))
+print(" ")
+
+#pCO2_umol_L
+print("pCO2_umol_L")
+cat(" mean",mean(pointsdatafinal$ppm.in.water_umol_L,na.rm = T))
+cat(" median",mean(pointsdatafinal$ppm.in.water_umol_L,na.rm = T))
+cat("min",min(pointsdatafinal$ppm.in.water_umol_L,na.rm = T))
+cat(" max",max(pointsdatafinal$ppm.in.water_umol_L,na.rm = T))
+print(" ")
+
+#pco2 by order 
+library(dplyr)
+point_all_order1 <- filter(pointsdatafinal, order == 1)
+print("order 1")
+cat("mean",mean(point_all_order1$ppm.in.water_umol_L))
+cat(" max",max(point_all_order1$ppm.in.water_umol_L))
+cat(" min",min(point_all_order1$ppm.in.water_umol_L))
+print(" ")
+
+point_all_order2 <- filter(pointsdatafinal, order == 2)
+print("order 2")
+cat("mean",mean(point_all_order2$ppm.in.water_umol_L, na.rm =T))
+cat(" max",max(point_all_order2$ppm.in.water_umol_L, na.rm =T))
+cat(" min",min(point_all_order2$ppm.in.water_umol_L, na.rm =T))
+print(" ")
+
+point_all_order3 <- filter(pointsdatafinal, order == 3)
+print("order 3")
+cat("mean",mean(point_all_order3$ppm.in.water_umol_L))
+cat(" max",max(point_all_order3$ppm.in.water_umol_L))
+cat(" min",min(point_all_order3$ppm.in.water_umol_L))
+print(" ")
+
+point_all_order4 <- filter(pointsdatafinal, order == 4)
+print("order 4 - note will not exist for August")
+cat("mean",mean(point_all_order4$ppm.in.water_umol_L))
+cat(" max",max(point_all_order4$ppm.in.water_umol_L))
+cat(" min",min(point_all_order4$ppm.in.water_umol_L))
+print("")
+
+```
+
+Stream Area summary
+
+```{r}
+
+#total length of the stream (km)
+print("total length of the stream (km)")
+sum(df$delta_1,na.rm = T)/1000
+
+#total area of the stream 
+print("total area of the stream (km2") 
+sum(df$delta_1 * df$width,na.rm = T)*1e-6 
+
+#total area of the watershed 
+print("area of watershed (km2")
+df$area[nrow(df)]
+
+#%area of the stream
+print("% area of stream compared to watershed")
+sum(df$delta_1 * df$width,na.rm = T)*1e-6 / df$area[nrow(df)] * 100 
+```
+
+Summary of modeled points (CO2)
+
+```{r}
+print("Stream network model pCO2")
+print("min")
+print(min(df$cback2, na.rm=T))
+print("max")
+print(max(df$cback2, na.rm=T))
+print("mean")
+print(mean(df$cback2, na.rm=T))
+
+print("Stream network model pCO2 umol/L")
+print("min")
+print(min(df$cback2_umol_L, na.rm=T))
+print("max")
+print(max(df$cback2_umol_L, na.rm=T))
+print("mean")
+print(mean(df$cback2_umol_L, na.rm=T))
+
+```
+
+Summary of k_600 and k_co2
+
+```{r}
+
+#Summary of k_600 
+summary(df$k_600) #s^-1
+
+summary(df$k_600_m_day) #m/day
+
+#Summary of KCO2 
+summary(df$k) #s^-1
+
+summary(df$k*df$depth*24*60*60) #m/day 
+
+
+
+```
+
+Fluxes summary
+
+```{r}
+#Gg C /day
+print("Mg C /day from groundwater")
+sum(df$fluxesGW_kgC_day,na.rm = T)/1000
+print("Mg C /day from internal production")
+sum(df$fluxesBZ_kgC_day,na.rm = T)/1000
+print("total Mg C /day")
+sum(df$fluxes_kgC_day,na.rm = T)/1000
+#%
+print("% from groundwater")
+sum(df$fluxesGW_kgC_day,na.rm = T)*100/sum(df$fluxes_kgC_day,na.rm = T)
+print("% from respiration")
+#sum(df$fluxesBZ_kgC_day,na.rm = T)*100/sum(df$fluxes_kgC_day,na.rm = T)
+mean(df$resp_per, na.rm = TRUE)
+min(df$resp_per, na.rm = TRUE)
+max(df$resp_per, na.rm = TRUE)
+
+#Mean flux (g C /m2/day) 
+print("Mean flux (g C /m2/day)")
+mean(df$fluxes_kgC_m2_day,na.rm = T)*1000
+#Median flux (g C /m2/day) 
+print("Median flux (g C /m2/day)")
+median(df$fluxes_kgC_m2_day,na.rm = T)*1000
+
+#total Mg C /day 
+print("total Mg C /day")
+sum(df$fluxes_kgC_day,na.rm = T)/1000
+
+#fluxes by order 
+library(dplyr)
+df_order_1 <- filter(df, order == 1)
+print("Mean order 1")
+mean(df_order_1$fluxes_kgC_m2_day,na.rm =T)*1000
+
+
+df_order_2 <- filter(df, order == 2)
+print("Mean order 2")
+mean(df_order_2$fluxes_kgC_m2_day, na.rm =T)*1000
+
+
+df_order_3 <- filter(df, order == 3)
+print("Mean order 3")
+mean(df_order_3$fluxes_kgC_m2_day, na.rm =T)*1000
+
+
+df_order_4 <- filter(df, order == 4)
+print("Mean order 4 - note will not exist for August")
+mean(df_order_4$fluxes_kgC_m2_day, na.rm =T)*1000
+
+#Percent of first order streams 
+print("% of first order streams")
+sum(df_order_1$delta_1,na.rm = T) / sum(df$delta_1,na.rm = T) * 100  
+
+
+```
+
+Bar chart - fluxes vs. terrestrial. This figure does not include model inputs (can be run without running model)
+
+```{r}
+terrest <- data.frame(matrix(ncol = 3, nrow = 4))
+x <- c("month", "Environment", "Flux")
+colnames(terrest) <- x
+terrest$month <- c("August", "November", "August", "November")
+terrest$Environment <- c("Stream", "Stream", "Watershed", "Watershed")
+terrest$Flux <- c(0.1,1.22,-5.5, -2.2)
+terrest$Flux_actual <- c(0.034,1.22,-5.5, -2.2)
+
+ggplot(terrest %>% arrange(Environment), 
+       aes(x = month, y = Flux, fill = Environment)) + 
+  geom_col(position = "identity", width = 0.8) +
+  geom_text(aes(label=Flux_actual), vjust=0.1, size=4.5)+
+  theme_minimal() +
+  ylab("Flux (Mg C / day)") +
+  xlab("") +
+  scale_fill_manual(values=c("lightblue3", "darkolivegreen3"))+
+   theme(legend.title =  element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position="bottom",
+        legend.text=element_text(size=12),
+        #axis.text.y=element_blank(), 
+        #axis.ticks.y=element_blank(),
+        panel.background = element_rect(fill=NA, color = NA),
+        strip.background = element_rect(fill=NA, color=NA),
+        axis.text = element_text(size= 12),
+        axis.title = element_text(size = 12),
+        plot.title = element_text(hjust = 0.5)) +
+  coord_fixed(ratio = .1) +
+   #ggtitle("Flux (Mg C / day)") +
+  scale_x_discrete(position = "top") 
+```
+
+Modeled points by order (CO2)
+
+```{r}
+#pco2 by order 
+print("order 1")
+cat("mean",mean(df_order1$cback2,na.rm=T))
+cat(" max",max(df_order1$cback2,na.rm=T))
+print("min")
+df_order1 %>% filter(cback2 > 0) %>% summarize( min(cback2, na.rm = TRUE))
+print(" ")
+
+print("order 2")
+cat("mean",mean(df_order2$cback2,na.rm=T))
+cat(" max",max(df_order2$cback2,na.rm=T))
+print("min")
+df_order2 %>% filter(cback2 > 0) %>% summarize( min(cback2, na.rm = TRUE))
+print(" ")
+
+
+print("order 3")
+cat("mean",mean(df_order3$cback2,na.rm=T))
+cat(" max",max(df_order3$cback2,na.rm=T))
+print("min")
+df_order3 %>% filter(cback2 > 0) %>% summarize( min(cback2, na.rm = TRUE))
+print(" ")
+
+print("order 4")
+cat("mea",mean(df_order4$cback2,na.rm=T))
+cat(" max",max(df_order4$cback2,na.rm=T))
+cat(" min",min(df_order4$cback2,na.rm=T))
+print("")
+
+print("order 5")
+cat("mea",mean(df_order5$cback2,na.rm=T))
+cat(" max",max(df_order5$cback2,na.rm=T))
+cat(" min",min(df_order5$cback2,na.rm=T))
+print("")
+```
+
+Fluxes by order
+
+```{r}
+#model fluxes aren't normalized
+print("model aren't normalized fluxes kg C/m2/day")
+cat(" mean",mean(df$fluxes_kgC_m2_day,na.rm = T))
+cat(" min",min(df$fluxes_kgC_m2_day,na.rm = T))
+cat(" max",max(df$fluxes_kgC_m2_day,na.rm = T))
+print("")
+
+print("model total fluxes Gg C/day")
+sum(df$fluxes_kgC_day,na.rm = T)/1000000#Gg C/day
+print("")
+
+print("model total fluxes Gg C/day by order")
+cat(" first",sum(df_order1$fluxes_kgC_day,na.rm = T)/1000000)#Gg C/day)
+cat(" second",sum(df_order2$fluxes_kgC_day,na.rm = T)/1000000)#Gg C/day
+cat(" third",sum(df_order3$fluxes_kgC_day,na.rm = T)/1000000)#Gg C/day
+cat(" forth",sum(df_order4$fluxes_kgC_day,na.rm = T)/1000000)#Gg C/day
+cat(" fith",sum(df_order5$fluxes_kgC_day,na.rm = T)/1000000)#Gg C/day
+print("")
+
+print("first order area normal fluxes kg C/m2/day")
+mean(df_order1$fluxes_kgC_m2_day,na.rm = T)
+
+cbackflux<-c()
+n<-1
+for(i in 1:length(l)){
+  for(j in 1:dim(l[[i]])[1]){
+    f<-l[[i]][j,18]*l[[i]][j,8]*l[[i]][j,15]*l[[i]][j,16]*(l[[i]][j,17]-400/1000000*l[[i]][j,25])*1000
+    cbackflux[n]<-f
+    n=n+1
+  }
+}
+
+cbackfluxt<-sum(cbackflux,na.rm=TRUE)
+
+cback2flux<-c()
+n<-1
+for(i in 1:length(l)){
+  for(j in 1:dim(l[[i]])[1]){
+    f<-l[[i]][j,18]*l[[i]][j,8]*l[[i]][j,15]*l[[i]][j,16]*(l[[i]][j,19]-400/1000000*l[[i]][j,25])*1000
+    cback2flux[n]<-f
+    n=n+1
+  }
+}
+cback2fluxt<-sum(cback2flux,na.rm=TRUE)
+
+
+cbackflux_total<-cback2fluxt
+
+GW_percent<- cbackfluxt/cbackflux_total*100
+bz_percent<- (cback2fluxt-cbackfluxt)/cbackflux_total*100
+
+print("calculated from cbak4")
+cat("%GW",GW_percent)  
+cat(" %BZ",bz_percent)
+print("")
+
+#% GW and BZ fluxes by order 
+print("order 1")
+cat("%GW fluxes",sum(df_order1$fluxesGW,na.rm = T)/sum(df_order1$fluxesall,na.rm = T)*100)
+cat("%BZ fluxes",sum(df_order1$fluxesBZ,na.rm = T)/sum(df_order1$fluxesall,na.rm = T)*100)
+#cat("%WC fluxes",sum(df_order1$fluxesWC,na.rm = T)/sum(df_order1$fluxesall,na.rm = T)*100)
+print("")
+
+print("order 2")
+cat("%GW fluxes",sum(df_order2$fluxesGW,na.rm = T)/sum(df_order2$fluxesall,na.rm = T)*100)
+cat("%BZ fluxes",sum(df_order2$fluxesBZ,na.rm = T)/sum(df_order2$fluxesall,na.rm = T)*100)
+#cat("%WC fluxes",sum(df_order2$fluxesWC,na.rm = T)/sum(df_order2$fluxesall,na.rm = T)*100)
+print("")
+
+print("order 3")
+cat("%GW fluxes",sum(df_order3$fluxesGW,na.rm = T)/sum(df_order3$fluxesall,na.rm = T)*100)
+cat("%BZ fluxes",sum(df_order3$fluxesBZ,na.rm = T)/sum(df_order3$fluxesall,na.rm = T)*100)
+#cat("%WC fluxes",sum(df_order3$fluxesWC,na.rm = T)/sum(df_order3$fluxesall,na.rm = T)*100)
+print("")
+
+print("order 4")
+cat("%GW fluxes",sum(df_order4$fluxesGW,na.rm = T)/sum(df_order4$fluxesall,na.rm = T)*100)
+cat("%BZ fluxes",sum(df_order4$fluxesBZ,na.rm = T)/sum(df_order4$fluxesall,na.rm = T)*100)
+#cat("%WC fluxes",sum(df_order4$fluxesWC,na.rm = T)/sum(df_order4$fluxesall,na.rm = T)*100)
+print("")
+
+print("order 5")
+cat("%GW fluxes",sum(df_order5$fluxesGW,na.rm = T)/sum(df_order5$fluxesall,na.rm = T)*100)
+cat("%BZ fluxes",sum(df_order5$fluxesBZ,na.rm = T)/sum(df_order5$fluxesall,na.rm = T)*100)
+#cat("%WC fluxes",sum(df_order5$fluxesWC,na.rm = T)/sum(df_order5$fluxesall,na.rm = T)*100)
+print("")
+
+print("GW fluxe cor with Q")
+cor(df$fluxesGW,df$Q, use = "complete.obs")
+print("BZ fluxe cor with Q")
+cor(df$fluxesBZ,df$Q, use = "complete.obs")
+#print("WC fluxe cor with Q")
+#cor(df$fluxesWC,df$Q, use = "complete.obs")
+
+
+points
+```
+
+This section includes the components to make the figures.
+
+Run before running other figures - this loads additional visual data needed to make figures
+
+```{r}
+
+# importing mask
+library(maptools)
+library(sp)
+library(rgeos)
+library(rgdal)
+
+
+pumphouse <- readOGR('.', 'MART_watershed_projected')
+summary(pumphouse)
+pumphouse1 <- spTransform(pumphouse, CRS("+proj=longlat +datum=NAD83 +no_defs +ellps=GRS80 +towgs84=0,0,0"))
+plot(pumphouse1, axes=T)
+
+library(raster)
+library(RColorBrewer)
+library(manipulate) # Included with RStudio
+library(lubridate)
+library(suncalc)
+
+DEMclip <- mask(dem, pumphouse1)
+
+# convert imported dem to a xyz table
+DEM<-data.frame(rasterToPoints(DEMclip))
+colnames(DEM) <- c("X","Y","Elevation")
+
+# Next the shapefile has to be converted to a dataframe for use in ggplot2
+pumphouse2 <- fortify(pumphouse1)
+# Next the shapefile has to be converted to a dataframe for use in ggplot2
+#linesclip <- crop(lines, pumphouse1)
+lines1 <- fortify(lines)
+```
+
+Figure 1. Sample Concentrations
+
+```{r}
+library(ggsn)
+
+temp <- pointsdatafinal[(pointsdatafinal$ppm.in.water>2000),]
+temp <- pointsdatafinal
+temp <- subset(pointsdatafinal, !is.na(ppm.in.water)) 
+my_breaks = c(200,1000,6500)
+my_labels = c(" 200"," 1000",">7000")
+sample <- ggplot(DEM,aes(x=X,y=Y))+
+  geom_contour(aes(z=Elevation),colour = "black",bins = 6)+
+  geom_raster(aes(fill=Elevation),alpha=0.75)+
+  scale_fill_gradient(name="Elevation (m)",low = "darkolivegreen3", high = "tan4", breaks = c(400,900))+
+  theme_minimal()+coord_equal()+
+  xlab("")+ylab("")+
+  geom_path(data = pumphouse2,aes(x = long, y = lat, group = group),
+            color = 'black', fill = 'white', size = .7)+
+  geom_path(data = lines1,aes(x = long, y = lat, group = group),
+            color = 'blue', fill = NA, size = .7)+
+  geom_point(data = temp, aes(x = Longitude, y = Latitude, color = ppm.in.water), size = 2)+
+  #geom_text_repel(data = temp, aes(x = Longitude, y = Latitude, label = Sample), min.segment.length = 0, max.overlaps = Inf) +
+  scale_color_gradient2(name = expression(paste("pCO"[2]*" (ppm)")),midpoint=3.9, low="white", mid="red",high="red4", space ="Lab",tran="log10",breaks = my_breaks,labels = my_labels, limits = c(200,7000))+
+  coord_fixed(ratio=1.3)+theme_classic()+
+  theme(axis.text = element_text(size= 12),axis.title = element_text(size = 12), 
+        legend.text=element_text(size=18), legend.title=element_text(size=18))+
+  scalebar(pumphouse2, dist = 0.5, dist_unit = "km",transform = TRUE, model = "WGS84",location="topright", st.bottom = FALSE, st.dist = 0.05, st.color = "gray40", box.fill = c("gray40", "white")) +
+  blank() 
+
+sample
+
+jpeg(file=paste0("/Users/Hannah/Library/CloudStorage/OneDrive-UW/NEON Data/Papers/Martha_Creek/Figures/Sample_",month,".jpeg"),width=7, height=5,
+     units="in", res=300, pointsize=10)
+print(sample)
+dev.off()
+
+temp <- pointsdatafinal[(pointsdatafinal$ppm.in.water>2000),]
+temp <- pointsdatafinal
+temp <- subset(pointsdatafinal, !is.na(ppm.in.water)) 
+my_breaks = c(10,50,325)
+my_labels = c(" 10", " 50"," >350")
+sample_umol <- ggplot(DEM,aes(x=X,y=Y))+
+  geom_contour(aes(z=Elevation),colour = "black",bins = 6)+
+  geom_raster(aes(fill=Elevation),alpha=0.75)+
+  scale_fill_gradient(name="Elevation (m)",low = "darkolivegreen3", high = "tan4", breaks = c(400,900))+
+  theme_minimal()+coord_equal()+
+  xlab("")+ylab("")+
+  geom_path(data = pumphouse2,aes(x = long, y = lat, group = group),
+            color = 'black', fill = 'white', size = .7)+
+  geom_path(data = lines1,aes(x = long, y = lat, group = group),
+            color = 'blue', fill = NA, size = .7)+
+  geom_point(data = temp, aes(x = Longitude, y = Latitude, color = ppm.in.water_umol_L), size = 2)+
+  #geom_text_repel(data = temp, aes(x = Longitude, y = Latitude, label = Sample), min.segment.length = 0, max.overlaps = Inf) +
+  scale_color_gradient2(name = expression(paste("pCO"[2]*" (µmol/L)")),midpoint=2.6, low="white", mid="red",high="red4", space ="Lab",tran="log10",breaks = my_breaks,labels = my_labels, limits = c(10,350))+
+  coord_fixed(ratio=1.3)+theme_classic()+
+  theme(axis.text = element_text(size= 12),axis.title = element_text(size = 12), 
+        legend.text=element_text(size=18), legend.title=element_text(size=18))+
+  scalebar(pumphouse2, dist = 0.5, dist_unit = "km",transform = TRUE, model = "WGS84",location="topright", st.bottom = FALSE, st.dist = 0.05, st.color = "gray40", box.fill = c("gray40", "white")) +
+  blank() 
+
+sample_umol
+
+jpeg(file=paste0("/Users/Hannah/Library/CloudStorage/OneDrive-UW/NEON Data/Papers/Martha_Creek/Figures/Sample_umol",month,".jpeg"),width=7, height=5,
+     units="in", res=300, pointsize=10)
+print(sample_umol)
+dev.off()
+
+```
+
+Figure 2 - Inset Map of Sample Locations
+
+```{r}
+library(ggsn)
+library(cowplot)
+library(stringr) 
+my_breaks = c(0,0.1,0.2,0.5,1)
+sensors <- pointsdatafinal[str_detect(pointsdatafinal$Sample, "STR"), ] 
+wells <- data.frame(Name = c("Well3", "Well6"),
+                 Longitude = c(-121.93354, -121.92949),
+                 Latitude = c(45.791304, 45.79214))
+  
+ggm2 <- ggplot(DEM,aes(x=X,y=Y))+
+  geom_contour(aes(z=Elevation),colour = "black",bins = 6)+
+  geom_raster(aes(fill=Elevation),alpha=0.75)+
+  scale_fill_gradient(name="Elevation(m)",low = "darkolivegreen3", high = "tan4", breaks = c(400,900))+
+  theme_minimal()+coord_equal()+xlab("Longitude")+ylab("Latitude")+
+  geom_path(data = pumphouse2,aes(x = long, y = lat, group = group),
+            color = 'black', fill = 'white', size = .7)+
+  geom_path(data = lines1,aes(x = long, y = lat, group = group),
+            color = 'blue', fill = NA, size = .7)+
+  geom_point(data = sensors, aes(x = Longitude, y = Latitude, colour = "Sensors"), size = 2)+
+  #geom_point(data = wells, aes(x = Longitude, y = Latitude, colour = "Wells"), size = 2, shape = 13)+
+  scale_color_manual(values=c(Sensors="black"), 
+  #                            Wells="red"), 
+                     name = "")+
+  coord_fixed(ratio=1.3)+theme_classic()+
+  theme(axis.text = element_text(size= 12),axis.title = element_text(size = 12),
+        legend.text=element_text(size=18), legend.title=element_text(size=18))+
+  scalebar(pumphouse2, dist = 0.5, dist_unit = "km",transform = TRUE, model = "WGS84",location="topright", st.bottom = FALSE, st.dist = 0.05, st.color = "gray40", box.fill = c("gray40", "white")) 
+
+# #basic mapping
+library(maps)
+ MainStates <- map_data("state")
+ Washington <- subset(MainStates, region == "washington")
+# 
+ggm1 <- ggplot()+
+   theme_classic()+
+   geom_polygon(data=Washington, aes(x=long, y=lat, group=group),
+                color="black",fill="white")+
+   geom_point(data = filter(df,Q==max(df$Q,na.rm=T)), aes(x = Longmodel, y = Latmodel),colour = "darkolivegreen4",size = 5,shape=18)+
+   coord_fixed(ratio=1.2)+
+   theme(legend.position = "none",
+         axis.text = element_text(size= 12),axis.title = element_text(size = 12)) + 
+  theme_void() 
+
+gg_inset_map1 = ggdraw() +
+  draw_plot(ggm2) +
+  draw_plot(ggm1, x = 0.1, y = 0.75, width = 0.2, height = 0.2)
+
+gg_inset_map1
+
+jpeg(file=paste0("/Users/Hannah/Library/CloudStorage/OneDrive-UW/NEON Data/Papers/Martha_Creek/Figures/inset_map"),width=7, height=5,
+     units="in", res=300, pointsize=10)
+print(gg_inset_map1)
+dev.off()
+```
+
+Map for other measured variables
+
+```{r}
+library(ggsn)
+my_breaks = c(0,10, 20, 30, 38)
+my_labels = c(0,10, 20, 30, 40)
+ggm2 <- ggplot(DEM,aes(x=X,y=Y))+
+  geom_contour(aes(z=Elevation),colour = "black",bins = 6)+
+  geom_raster(aes(fill=Elevation),alpha=0.75)+
+  scale_fill_gradient(name="Elevation(m)",low = "darkolivegreen3", high = "tan4")+
+  theme_bw()+coord_equal()+xlab("Longitude")+ylab("Latitude")+
+  geom_path(data = pumphouse2,aes(x = long, y = lat, group = group),
+            color = 'black', fill = 'white', size = .7)+
+  geom_path(data = lines1,aes(x = long, y = lat, group = group),
+            color = 'blue', fill = NA, size = .7)+
+  geom_point(data = pointsdatafinal, aes(x = Longitude, y = Latitude, color = SpConductivity_us_cm), size = 2)+
+  scale_color_gradient2(name = "Specific Conductivity uS/cm", low="white", mid="turquoise",high="darkblue", space ="Lab" , 
+                         midpoint=median(pointsdatafinal$SpConductivity_us_cm, na.rm = TRUE))+
+  coord_fixed(ratio=1.3)+theme_classic()+
+  theme(axis.text = element_text(size= 12),axis.title = element_text(size = 12))+
+  scalebar(pumphouse2, dist = 0.5, dist_unit = "km",transform = TRUE, model = "WGS84",location="topright", st.bottom = FALSE, st.dist = 0.05, st.color = "gray40", box.fill = c("gray40", "white")) +
+  theme_minimal() + 
+  blank() 
+
+ggm2
+```
+
+Figure 3 and 4 - Plot of modeled concentrations and modeled flux
+
+```{r}
+library(ggsn)
+#final
+my_breaks = c(200,1000,3000,10000)
+my_labels = c(200,1000,3000,">10,000")
+#log10 co2
+model_plot <- ggplot(DEM,aes(x=X,y=Y))+
+  geom_contour(aes(z=Elevation),colour = "black",bins = 6)+
+  geom_raster(aes(fill=Elevation),alpha=0.75)+
+  scale_fill_gradient(name="Elevation (m)",low = "darkolivegreen3", high = "tan4", breaks = c(400,900))+
+  theme_minimal()+coord_equal()+xlab("")+ylab("")+
+  geom_path(data = pumphouse2,aes(x = long, y = lat, group = group),
+            color = 'black', fill = 'white', size = .7)+
+  geom_point(data = filter(df,cback4>10000), aes(x = Longmodel, y = Latmodel), colour = "red4",size = 3)+
+  geom_point(data = filter(df,cback4<10000), aes(x = Longmodel, y = Latmodel, colour = cback2),size = 3)+
+  scale_color_gradient2(name = expression(paste("pCO"[2]*"(ppm)")),midpoint=4.2, low="white", mid="red",high="red4", space ="Lab",tran="log10",breaks = my_breaks, labels=my_labels,limits = c(200,10000))+
+  coord_fixed(ratio=1.3) + theme_classic() +
+  theme(axis.text = element_text(size= 12),axis.title = element_text(size = 12),
+        legend.text=element_text(size=18), legend.title=element_text(size=18)) +
+blank() 
+
+model_plot
+
+#final umol/L
+my_breaks = c(10,50,150,500)
+my_labels = c(" 10"," 50"," 150",">500")
+#log10 co2
+model_plot_umol <- ggplot(DEM,aes(x=X,y=Y))+
+  geom_contour(aes(z=Elevation),colour = "black",bins = 6)+
+  geom_raster(aes(fill=Elevation),alpha=0.75)+
+  scale_fill_gradient(name="Elevation (m)",low = "darkolivegreen3", high = "tan4", breaks = c(400,900))+
+  theme_minimal()+coord_equal()+xlab("")+ylab("")+
+  geom_path(data = pumphouse2,aes(x = long, y = lat, group = group),
+            color = 'black', fill = 'white', size = .7)+
+  geom_point(data = filter(df,cback2_umol_L>500), aes(x = Longmodel, y = Latmodel), colour = "red4",size = 3)+
+  geom_point(data = filter(df,cback2_umol_L<500), aes(x = Longmodel, y = Latmodel, colour = cback2_umol_L),size = 3)+
+  scale_color_gradient2(name = expression(paste("pCO"[2]*"(µmol/L)")),midpoint=2.8, low="white", mid="red",high="red4", space ="Lab",tran="log10",breaks = my_breaks, labels=my_labels,limits = c(10,500))+
+  coord_fixed(ratio=1.3) + theme_classic() +
+  theme(axis.text = element_text(size= 12),axis.title = element_text(size = 12),
+        legend.text=element_text(size=18), legend.title=element_text(size=18)) +
+blank() 
+
+model_plot_umol
+
+jpeg(file=paste0("/Users/Hannah/Library/CloudStorage/OneDrive-UW/NEON Data/Papers/Martha_Creek/Figures/model_org_umol_adj",month,".jpeg"),width=7, height=5,
+     units="in", res=300, pointsize=10)
+print(model_plot_umol)
+dev.off()
+
+
+#For August
+my_breaks = c(0,20,34)
+my_labels = c(0,20,"30")
+
+#For November
+#my_breaks = c(1,150,280)
+#my_labels = c("<0",150,">300")
+
+flux <- ggplot(DEM,aes(x=X,y=Y))+
+  geom_contour(aes(z=Elevation),colour = "black",fill=NA,bins = 6)+
+  geom_raster(aes(fill=Elevation),alpha=0.75)+
+  scale_fill_gradient(name="Elevation (m)",low = "darkolivegreen3", high = "tan4", breaks = c(400,900))+
+  coord_equal()+xlab("Longitude")+ylab("Latitude")+
+   geom_path(data = pumphouse2,aes(x = long, y = lat, group = group),
+             color = 'black', fill = 'white', size = .7)+
+  theme_minimal() + 
+  #For August 
+  geom_point(data = filter(df,fluxes_kgC_m2_day*1000>30), aes(x = Longmodel, y = Latmodel), colour = "darkturquoise",size = 3)+
+  geom_point(data = filter(df,fluxes_kgC_m2_day*1000<30), aes(x = Longmodel, y = Latmodel, colour = fluxes_kgC_m2_day*1000 ),size = 3)+
+  scale_color_gradient(name = expression(paste("g C /m"^2*"/day")),low="white", high="darkturquoise", space ="Lab", limits = c(-2,35), breaks = my_breaks, labels = my_labels)+
+  
+  #For November
+  #geom_point(data = filter(df,fluxes_kgC_m2_day*1000>300), aes(x = Longmodel, y = Latmodel), colour = "blue4",size = 3)+
+  #geom_point(data = filter(df,fluxes_kgC_m2_day*1000<0), aes(x = Longmodel, y = Latmodel), colour = "white",size = 3)+
+  #geom_point(data = filter(df,fluxes_kgC_m2_day*1000<300 & fluxes_kgC_m2_day*1000>0), aes(x = Longmodel, y = Latmodel, colour = fluxes_kgC_m2_day*1000 ),size = 3)+
+  #scale_color_gradient2(name = expression(paste("g C /m"^2*"/day")),midpoint=150,low="gray99", mid="darkturquoise",high="blue4", space ="Lab", breaks = my_breaks, labels = my_labels)+
+  
+  coord_fixed(ratio=1.3) +
+  theme(axis.text = element_text(size= 12),axis.title = element_text(size = 12), legend.text=element_text(size=18), legend.title=element_text(size=18)) + 
+  blank() 
+
+flux
+
+
+jpeg(file=paste0("/Users/Hannah/Library/CloudStorage/OneDrive-UW/NEON Data/Papers/Martha_Creek/Figures/flux", month, ".jpeg"),width=7, height=5,
+     units="in", res=300, pointsize=10)
+print(flux)
+dev.off()
+
+
+```
