@@ -1,7 +1,7 @@
 # Martha Creek Stream Network Model
 
 
-We updated the stream network model developed by Saccardi and Winnick (2021) to predict pCO2 for the Martha Creek network. The stream network model allows us to address the issue of heterogeneity by accounting for variability in hydrology throughout the stream. We updated the model by including measured groundwater concentrations and a stream metabolism model instead of optimization. We were also able to compare the gas exchange coefficient used with experimental data from the site. The model was used to predict pCO2 concentrations based on the advection-reaction equation for solute transport. 
+We updated the stream network model developed by Saccardi and Winnick (2021) to predict pCO2 for the Martha Creek network located in Stabler, WA. The stream network model allows us to address the issue of heterogeneity by accounting for variability in hydrology throughout the stream. We updated the model by including measured groundwater concentrations and a stream metabolism model instead of optimization. We were also able to compare the gas exchange coefficient used with experimental data from the site. The model was used to predict pCO2 concentrations based on the advection-reaction equation for solute transport. 
 
 
 
